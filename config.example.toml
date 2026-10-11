@@ -1,0 +1,39 @@
+# witches 配置：~/.witches/config.toml
+# 改完立即生效，不用重启服务；新加的模型要新开 Codex 线程（或重启 app-server）才会出现在模型列表里。
+port = 10777
+
+# 纯文本模型收到图片时，先交给这个模型转成文字描述（按图片哈希缓存）。不配则纯文本模型不收图。
+# vision = "mimo/mimo-v2.6-pro"
+
+# 子代理/审查改用第三方模型。key 是 Codex 请求头 x-openai-subagent 的值：
+#   collab_spawn = spawn_agent 子代理   guardian = 自动审批审查   review = /review   memory_consolidation = 记忆整理
+# 只改派原本发给 GPT 的请求；子代理自己选了 witches 模型的不动。
+[route]
+# collab_spawn = "gateway/glm-5.3"
+# guardian = "gateway/kimi-k3"
+
+# provider 名字就是模型前缀：下面的模型在 Codex 里叫 gateway/glm-5.3、gateway/kimi-k3
+[providers.gateway]
+base_url = "https://your-gateway.example.com/v1"
+api_key = "sk-..."
+wire = "chat"             # chat（默认，witches 做 Responses<->Chat 翻译）| responses（上游原生支持 Responses）
+max_concurrency = 6       # 可选：同时打到这个上游的请求数，多出来的排队（防子代理并发触发 429）
+# prompt_cache_key = true  # 可选：把 Codex 的 prompt_cache_key 转给上游（Kimi 等支持）
+# headers = { "User-Agent" = "..." }
+
+[providers.gateway.models]
+# 模型选项：
+#   name 显示名 | context 上下文长度 | images 能否直接收图
+#   efforts 推理档位（只能用 Codex 认识的值：low/medium/high/xhigh…）| effort_map 档位 -> 上游取值（"" 表示不传）
+#   wire 覆盖 provider 的 wire | upstream 上游真实模型名 | extra 合并进请求体的字段
+#   fallback 429/5xx/连不上时依次改用的模型
+"glm-5.3" = { context = 200000, fallback = ["mimo/mimo-v2.6-pro"] }
+"kimi-k3" = { context = 262144, images = true, efforts = ["low", "medium", "high", "xhigh"], effort_map = { medium = "high", xhigh = "max" } }
+"gpt-6.1-sol" = { context = 272000, images = true, wire = "responses" }
+
+[providers.mimo]
+base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+api_key = "tp-..."
+
+[providers.mimo.models]
+"mimo-v2.6-pro" = { context = 1048576, images = true }

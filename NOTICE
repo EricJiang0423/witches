@@ -1,0 +1,13 @@
+witches
+Copyright (c) 2026 EricJiang0423 — MIT License (see LICENSE)
+
+This project includes material from OpenAI Codex (https://github.com/openai/codex),
+Copyright 2025 OpenAI, licensed under the Apache License, Version 2.0
+(see third_party/openai-codex-LICENSE):
+
+  * prompt.md — Codex's base instructions (codex-rs/models-manager/prompt.md), unmodified
+  * the compaction prompt and summary prefix strings in witches.py (COMPACT_PROMPT, SUMMARY_PREFIX)
+
+The design of the Codex integration (openai_base_url routing, /models merging,
+compaction handling) was informed by opencodex (https://github.com/lidge-jun/opencodex)
+and magpie (https://github.com/yetone/magpie); no code was copied from either.
