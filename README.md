@@ -29,7 +29,7 @@ mkdir -p ~/.witches && cp config.example.toml ~/.witches/config.toml   # 填上�
 
 `install` 做了这些事：
 
-1. 把 `witches.py`、`prompt.md` 复制到 `~/.witches/`，并软链接成 `~/.local/bin/witches`
+1. 把 `witches.py`、`prompt.md` 复制到 `~/.witches/`，并生成命令入口 `~/.local/bin/witches`
 2. 注册常驻服务（Linux：`systemd --user`；macOS：launchd），会带上当前 shell 的 `http(s)_proxy`/`no_proxy`
 3. 往 `~/.codex/config.toml` 顶部加一行 `openai_base_url = "http://127.0.0.1:10777/backend-api/codex"  # witches`（改之前备份为 `config.toml.witches-bak`）
 
@@ -45,7 +45,7 @@ mkdir -p ~/.witches && cp config.example.toml ~/.witches/config.toml   # 填上�
 ./witches.py deploy <ssh-host>
 ```
 
-把脚本、提示词和配置同步到远端 `~/.witches/`，然后在远端的登录 shell 里执行 `install`（这样能拿到 `.profile` 里的代理变量）。远端只需要装好 uv、并用 ChatGPT 登录过 Codex。
+把脚本、提示词和配置同步到远端 `~/.witches/`，然后在远端用户的登录 shell（Linux 一般是 bash，macOS 是 zsh）里执行 `install`，这样能拿到 `.profile`/`.zprofile` 里的代理变量和 PATH。远端只需要装好 uv、并用 ChatGPT 登录过 Codex。
 
 **每台远端可以配不同的模型**：Codex remote 的模型选择器显示的是那台远端 app-server 的模型列表，而每台机器的 witches 各读各的配置。`deploy <host>` 时，如果本机有 `~/.witches/hosts/<host>.toml` 就推它，否则推 `~/.witches/config.toml`。本机这些文件是唯一真源，`deploy` 会覆盖远端的配置。
 

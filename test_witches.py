@@ -112,6 +112,7 @@ def events(sse):
 ms = json.loads(urllib.request.urlopen(base + '/models?client_version=1').read())['models']
 assert [m['slug'] for m in ms] == ['gpt-x', 'Fake/m1', 'Fake/eye', 'R/g', 'Busy/m2'], ms
 assert ms[1]['input_modalities'] == ['text', 'image']  # 配了 vision，纯文本模型也声明收图
+assert '`m1` model' in ms[1]['base_instructions'] and ms[1]['base_instructions'] != ms[2]['base_instructions']
 
 # 2. GPT 请求：zstd 压缩的原始字节原样转发
 raw = zstd.compress(json.dumps({'model': 'gpt-x', 'input': [{'type': 'message', 'role': 'user', 'content': 'q'}]}).encode())
@@ -189,5 +190,9 @@ assert 'SUMMARY' in json.loads(seen[0][2])['messages'][0]['content'], seen[0][2]
 status, sse = post({'model': 'R/g', 'input': []})
 item = events(sse)[0]['item']
 assert item['id'] == 'rs_wch_1' and 'encrypted_content' not in item, item
+
+# 11. 常驻服务的解释器不能是 uv 的临时环境（本测试本身就跑在 uv run --script 的临时环境里）
+py = witches.interpreter()
+assert sys.prefix == sys.base_prefix or not Path(py).resolve().is_relative_to(Path(sys.prefix).resolve()), py
 
 print('all checks passed')

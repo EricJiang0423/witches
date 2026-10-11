@@ -85,7 +85,7 @@ def catalog(cfg):
             levels = m.get('efforts', ['low', 'medium', 'high'])
             out.append({
                 'slug': f'{pname}/{mid}', 'display_name': m.get('name', f'{pname}/{mid}'),
-                'description': f'{pname}/{mid} via witches', 'base_instructions': PROMPT,
+                'description': f'{pname}/{mid} via witches', 'base_instructions': identity(pname, mid) + PROMPT,
                 'default_reasoning_level': m.get('default_effort', 'medium' if 'medium' in levels else levels[0])
                 if levels else None,
                 'supported_reasoning_levels': [{'effort': e, 'description': e} for e in levels],
@@ -98,6 +98,14 @@ def catalog(cfg):
                 'input_modalities': ['text', 'image'] if m.get('images') or cfg.get('vision') else ['text'],
             })
     return out
+
+
+def identity(pname, mid):
+    """每个模型的系统提示开头写明身份。线程中途换模型时 Codex 会把新模型的系统提示作为 <model_switch> 插进历史，
+    不写的话模型会顺着历史里 GPT 的说明自称 GPT；写了，witches 模型之间互切时提示也不同，Codex 才会插入切换说明。"""
+    return (f'You are Codex, a coding agent powered by the `{mid}` model (provider `{pname}`, routed through witches). '
+            'When asked which model you are, answer with this model name. Earlier messages in this conversation may '
+            'describe a different model because the user switched models; this instruction takes precedence.\n\n')
 
 
 def effort(m, want):
@@ -702,10 +710,15 @@ class Handler(BaseHTTPRequestHandler):
         """原样转发到 OpenAI，响应头和响应体逐字节回传。"""
         h = headers or {k: v for k, v in self.headers.items() if k.lower() not in HOP}
         url = OPENAI[prefix] + self.path[len(prefix):]
-        try:
-            r = fetch(self.command, url, body or None, h)
-        except OSError as e:
-            return self.error(502, f'cannot reach {url}: {e}')
+        for attempt in range(3):  # 本地代理偶尔在 TLS 握手时断开（SSL EOF / reset），连接级错误原地重试
+            try:
+                r = fetch(self.command, url, body or None, h)
+                break
+            except OSError as e:
+                err = e
+                time.sleep(0.5 * (attempt + 1))
+        else:
+            return self.error(502, f'cannot reach {url}: {err}')
         self.send_response(r.status, r.reason)
         for k, v in r.getheaders():
             if k.lower() not in HOP:
@@ -916,17 +929,25 @@ def edit_codex(port=None):
         path.write_text(''.join(kept))
 
 
+def interpreter():
+    """常驻服务用的解释器：优先 PATH 里的 python3.14 稳定链接，别写死带补丁版本号的路径（brew upgrade 后会失效）。"""
+    venv = (Path(sys.prefix) / 'bin').resolve()  # uv run --script 把临时环境放在 PATH 最前，用完就删，必须跳过
+    path = os.pathsep.join(d for d in os.environ.get('PATH', '').split(os.pathsep) if d and Path(d).resolve() != venv)
+    return shutil.which(f'python3.{sys.version_info.minor}', path=path) or getattr(sys, '_base_executable', sys.executable)
+
+
 def service(action, port):
     """后台常驻：Linux 用 systemd --user，macOS 用 launchd；自动带上安装时 shell 里的代理环境变量。"""
-    py = getattr(sys, '_base_executable', sys.executable)
+    py = interpreter()
     script = HOME / 'witches.py'
     env = {k: v for k, v in os.environ.items() if k.lower() in ('http_proxy', 'https_proxy', 'no_proxy', 'all_proxy')}
     env['CODEX_HOME'] = str(CODEX_HOME)
     log = HOME / 'witches.log'
     if sys.platform == 'darwin':
         plist = Path.home() / 'Library/LaunchAgents/dev.witches.plist'
-        dom = f'gui/{os.getuid()}'
-        subprocess.run(['launchctl', 'bootout', f'{dom}/dev.witches'], capture_output=True)
+        doms = [f'gui/{os.getuid()}', f'user/{os.getuid()}']  # SSH 进来、没人登录桌面时只有 user 域可用
+        for dom in doms:
+            subprocess.run(['launchctl', 'bootout', f'{dom}/dev.witches'], capture_output=True)
         if action == 'remove':
             plist.unlink(missing_ok=True)
             return
@@ -941,8 +962,10 @@ def service(action, port):
 <key>StandardErrorPath</key><string>{log}</string><key>StandardOutPath</key><string>{log}</string>
 </dict></plist>
 ''')
-        subprocess.run(['launchctl', 'bootstrap', dom, str(plist)], check=True)
-        return
+        for dom in doms:
+            if subprocess.run(['launchctl', 'bootstrap', dom, str(plist)], capture_output=True).returncode == 0:
+                return
+        sys.exit(f'launchctl bootstrap 失败：{plist}')
     unit = Path.home() / '.config/systemd/user/witches.service'
     if action == 'remove':
         subprocess.run(['systemctl', '--user', 'disable', '--now', 'witches'], capture_output=True)
@@ -989,8 +1012,9 @@ def install(port):
     os.chmod(HOME / 'config.toml', 0o600)
     os.chmod(HOME / 'witches.py', 0o755)
     BIN.parent.mkdir(parents=True, exist_ok=True)
-    BIN.unlink(missing_ok=True)
-    BIN.symlink_to(HOME / 'witches.py')
+    BIN.unlink(missing_ok=True)  # 包装脚本直接调装好的解释器，运行时不依赖 PATH 里有 uv
+    BIN.write_text(f'#!/bin/sh\nexec "{interpreter()}" "{HOME / "witches.py"}" "$@"\n')
+    BIN.chmod(0o755)
     service('install', port)
     if not wait_up(port):
         sys.exit(f'witches 没起来，看日志：{HOME / "witches.log"}')
@@ -1004,7 +1028,7 @@ def uninstall():
     edit_codex(None)
     port = config().get('port', DEFAULT_PORT)
     service('remove', port)
-    if BIN.is_symlink():
+    if BIN.is_symlink() or BIN.exists() and str(HOME / 'witches.py') in BIN.read_text():
         BIN.unlink()
     print(f'✓ 已从 {CODEX_HOME / "config.toml"} 删掉 witches 那一行并停掉服务（{HOME} 保留）')
     print('  用 witches 模型压缩过的线程，卸载前先在 GPT 上 /compact 一次，否则那段摘要 GPT 读不到')
@@ -1031,7 +1055,7 @@ def status():
 
 
 def deploy(host):
-    """把脚本、提示词和配置同步到远端 ~/.witches，然后在登录 shell 里（拿到代理变量）执行 install。
+    """把脚本、提示词和配置同步到远端 ~/.witches，然后在远端用户的登录 shell 里（拿到代理变量）执行 install。
     每台远端可以有自己的模型：有 ~/.witches/hosts/<host>.toml 就用它，否则用 ~/.witches/config.toml。"""
     here = Path(__file__).resolve().parent
     subprocess.run(['ssh', host, 'mkdir -p ~/.witches && chmod 700 ~/.witches'], check=True)
@@ -1041,7 +1065,8 @@ def deploy(host):
     if cfg:
         print(f'配置：{cfg} -> {host}:~/.witches/config.toml')
         subprocess.run(['scp', '-q', str(cfg), f'{host}:.witches/config.toml'], check=True)
-    subprocess.run(['ssh', host, 'bash -lc "uv run --script ~/.witches/witches.py install"'], check=True)
+    # 用远端用户自己的登录 shell（macOS 是 zsh，读 .zprofile），才能拿到代理变量和 Homebrew 里的 uv
+    subprocess.run(['ssh', host, '"$SHELL" -lc "uv run --script ~/.witches/witches.py install"'], check=True)
 
 
 def main():
