@@ -1031,13 +1031,16 @@ def status():
 
 
 def deploy(host):
-    """把脚本、提示词和配置同步到远端 ~/.witches，然后在登录 shell 里（拿到代理变量）执行 install。"""
+    """把脚本、提示词和配置同步到远端 ~/.witches，然后在登录 shell 里（拿到代理变量）执行 install。
+    每台远端可以有自己的模型：有 ~/.witches/hosts/<host>.toml 就用它，否则用 ~/.witches/config.toml。"""
     here = Path(__file__).resolve().parent
     subprocess.run(['ssh', host, 'mkdir -p ~/.witches && chmod 700 ~/.witches'], check=True)
-    files = [here / 'witches.py', here / 'prompt.md', here / 'config.example.toml']
-    if (HOME / 'config.toml').exists():
-        files.append(HOME / 'config.toml')
-    subprocess.run(['scp', '-q', *map(str, files), f'{host}:.witches/'], check=True)
+    subprocess.run(['scp', '-q', *map(str, [here / 'witches.py', here / 'prompt.md', here / 'config.example.toml']),
+                    f'{host}:.witches/'], check=True)
+    cfg = next((f for f in (HOME / 'hosts' / f'{host}.toml', HOME / 'config.toml') if f.exists()), None)
+    if cfg:
+        print(f'配置：{cfg} -> {host}:~/.witches/config.toml')
+        subprocess.run(['scp', '-q', str(cfg), f'{host}:.witches/config.toml'], check=True)
     subprocess.run(['ssh', host, 'bash -lc "uv run --script ~/.witches/witches.py install"'], check=True)
 
 

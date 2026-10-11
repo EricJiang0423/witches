@@ -45,7 +45,17 @@ mkdir -p ~/.witches && cp config.example.toml ~/.witches/config.toml   # 填上�
 ./witches.py deploy <ssh-host>
 ```
 
-把脚本、提示词和本机的 `~/.witches/config.toml` 同步到远端 `~/.witches/`，然后在远端的登录 shell 里执行 `install`（这样能拿到 `.profile` 里的代理变量）。本机配置是唯一真源，`deploy` 会覆盖远端的配置。远端只需要装好 uv、并用 ChatGPT 登录过 Codex。
+把脚本、提示词和配置同步到远端 `~/.witches/`，然后在远端的登录 shell 里执行 `install`（这样能拿到 `.profile` 里的代理变量）。远端只需要装好 uv、并用 ChatGPT 登录过 Codex。
+
+**每台远端可以配不同的模型**：Codex remote 的模型选择器显示的是那台远端 app-server 的模型列表，而每台机器的 witches 各读各的配置。`deploy <host>` 时，如果本机有 `~/.witches/hosts/<host>.toml` 就推它，否则推 `~/.witches/config.toml`。本机这些文件是唯一真源，`deploy` 会覆盖远端的配置。
+
+```
+~/.witches/
+├── config.toml               默认（本机自己用，也是没有单独配置的远端用的）
+└── hosts/
+    ├── gpu-box.toml          deploy gpu-box 时用：比如只配内网能连到的模型
+    └── cloud-dev.toml        deploy cloud-dev 时用：比如只配公网 API
+```
 
 ## 配置
 
@@ -69,7 +79,7 @@ max_concurrency = 6
 "kimi-k3" = { context = 262144, images = true }
 ```
 
-配好之后，Codex 的模型列表里会多出 `gateway/glm-5.3` 这类模型，排在 GPT 后面。
+配好之后，Codex 的模型选择器（CLI 的 `/model` 和桌面端的下拉框都一样）会在 GPT 模型后面列出 `gateway/glm-5.3`、`mimo/mimo-v2.6-pro` 这类条目，每个都带自己的推理档位；配了 `vision` 的纯文本模型也会显示为能收图。显示名默认是 `provider/model`，可以用 `name` 改。
 
 ## 功能
 
