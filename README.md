@@ -63,7 +63,7 @@ mkdir -p ~/.witches && cp config.example.toml ~/.witches/config.toml   # 填上�
 
 ```toml
 port = 10777
-vision = "mimo/mimo-v2.6-pro"        # 可选：纯文本模型的"眼睛"
+vision = ["gateway/kimi-k3", "mimo/mimo-v2.6-pro"]   # 可选：纯文本模型的"眼睛"，依次回退
 
 [route]                              # 可选：子代理/审查改用第三方模型
 collab_spawn = "gateway/glm-5.3"
@@ -89,7 +89,7 @@ max_concurrency = 6
 | Responses 上游 | 原样转发，只给条目 id 打 `_wch` 标记、去掉别家的加密推理 |
 | 压缩 | 接住 Codex 的远程压缩（`compaction_trigger`）：把对话转成纯文本交给模型写摘要，再包成 compaction 条目还给 Codex；之后切回 GPT 时自动还原成明文 |
 | 子代理/审查改派 | `[route]` 按 Codex 的 `x-openai-subagent` 请求头（`collab_spawn` / `guardian` / `review` / `memory_consolidation`）把原本发给 GPT 的请求改派给第三方模型，不用改 Codex 配置 |
-| 看图代理 | 配了 `vision` 后，纯文本模型也会声明能收图；图片（用户贴的截图、`view_image`、浏览器/computer-use 截图）先交给 vision 模型转写成文字，按图片哈希缓存，同一张图只看一次 |
+| 看图代理 | 配了 `vision` 后，纯文本模型也会声明能收图；图片（用户贴的截图、`view_image`、浏览器/computer-use 截图）先交给 vision 模型用低推理强度转写成文字（`vision` 可写成列表依次回退），结果按图片哈希缓存在 `~/.witches/vision/`，同一张图只看一次，重启也不用重看。实测一张 1570×1312 的高密度中文截图：kimi-k3 约 33 秒转写完，第二次 1.7 秒 |
 | 429 规避 | `fallback` 遇到 429/5xx/连不上就在首字节前换下一个模型；整条链最多走 3 轮，按 `Retry-After` 或指数退避；`max_concurrency` 让突发请求排队 |
 | 代理 | 遵循 `http(s)_proxy`/`no_proxy`；私网 IP（含 Tailscale `100.64.0.0/10`）总是直连 |
 | 安全 | 只有带着本机 Codex 登录令牌（`auth.json`）的请求才能用第三方模型；只监听 127.0.0.1 |

@@ -2,8 +2,9 @@
 # 改完立即生效，不用重启服务；新加的模型要新开 Codex 线程（或重启 app-server）才会出现在模型列表里。
 port = 10777
 
-# 纯文本模型收到图片时，先交给这个模型转成文字描述（按图片哈希缓存）。不配则纯文本模型不收图。
-# vision = "mimo/mimo-v2.6-pro"
+# 纯文本模型收到图片时，先交给这个模型转写成文字（低推理强度；按图片哈希缓存在 ~/.witches/vision/）。
+# 可以写成列表，依次回退。不配则纯文本模型不收图。
+# vision = ["gateway/kimi-k3", "mimo/mimo-v2.6-pro"]
 
 # 子代理/审查改用第三方模型。key 是 Codex 请求头 x-openai-subagent 的值：
 #   collab_spawn = spawn_agent 子代理   guardian = 自动审批审查   review = /review   memory_consolidation = 记忆整理

@@ -70,7 +70,7 @@ witches.OPENAI['/backend-api/codex'] = up + '/backend-api/codex'
 (tmp / 'c').mkdir()
 (tmp / 'c' / 'auth.json').write_text(json.dumps({'tokens': {'access_token': 'TOKEN'}}))
 (tmp / 'w' / 'config.toml').write_text(f'''
-vision = "Fake/eye"
+vision = ["Busy/m2", "Fake/eye"]
 [route]
 collab_spawn = "Fake/m1"
 [providers.Fake]
@@ -177,7 +177,7 @@ post({'model': 'gpt-x', 'input': [{'type': 'additional_tools', 'tools': [
 chat = json.loads(seen[0][2])
 assert seen[0][0] == '/v1/chat/completions' and chat['tools'][0]['function']['name'] == 'exec', chat
 
-# 9. 看图代理：纯文本模型收到图片 -> 先让 Fake/eye 描述，同一张图第二次不再看
+# 9. 看图代理：纯文本模型收到图片 -> vision 列表里 Busy 429，回退到 Fake/eye 描述；结果落盘，同一张图第二次不再看
 img = {'type': 'message', 'role': 'user', 'content': [{'type': 'input_image', 'image_url': 'data:image/png;base64,AAAA'}]}
 for _ in range(2):
     seen.clear()
@@ -185,6 +185,7 @@ for _ in range(2):
 paths = [(s[0], json.loads(s[2])['stream']) for s in seen]
 assert paths == [('/v1/chat/completions', True)], paths  # 第二次只有正式请求，没有看图请求
 assert 'SUMMARY' in json.loads(seen[0][2])['messages'][0]['content'], seen[0][2]
+assert len(list((tmp / 'w' / 'vision').iterdir())) == 1
 
 # 10. 原生 Responses 上游：条目 id 打标记、加密推理去掉
 status, sse = post({'model': 'R/g', 'input': []})

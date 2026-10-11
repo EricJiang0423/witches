@@ -589,44 +589,62 @@ VISION_PROMPT = """You are the eyes of a coding assistant that cannot see images
 1. Transcribe ALL visible text verbatim (code, terminal output, error messages, UI labels, numbers, URLs).
 2. Then describe layout, UI state, diagrams or charts (axes, values, trends) and anything else notable.
 Be precise and complete; do not guess beyond what is visible."""
-_seen = {}  # sha256(图片) -> 描述。ponytail: 进程内缓存不设上限，常驻很久内存涨了再换 LRU
 
 
 def see(req, cfg):
-    """纯文本模型：把输入里的图片先交给 [vision] 模型转成文字。按图片哈希缓存，历史里的旧图不会每轮重看。"""
+    """纯文本模型：把输入里的图片先交给 vision 模型转成文字。
+    vision 可以是列表（依次回退）；结果按图片哈希缓存在 ~/.witches/vision/，重启后历史里的旧图也不用重看。"""
     def parts_of(it):
         key = {'message': 'content', 'function_call_output': 'output', 'custom_tool_call_output': 'output'}.get(it.get('type'))
         return key, (it.get(key) if key and isinstance(it.get(key), list) else [])
 
-    key = lambda u: hashlib.sha256(u.encode()).hexdigest()
-    urls = {c['image_url'] for it in req.get('input') or [] for c in parts_of(it)[1]
-            if c.get('type') == 'input_image' and c.get('image_url')}
-    todo = [u for u in urls if key(u) not in _seen]
-    found = lookup(cfg, cfg['vision'])
-    failed = {}
+    def cache(u):
+        return HOME / 'vision' / hashlib.sha256(u.encode()).hexdigest()
 
     def describe(u):
-        t0 = time.time()
-        try:
-            text, _ = oneshot(*found, {'input': [{'type': 'message', 'role': 'user', 'content': [
-                {'type': 'input_text', 'text': VISION_PROMPT}, {'type': 'input_image', 'image_url': u}]}]})
-            _seen[key(u)] = text or '(empty description)'
-        except (Upstream, ValueError, KeyError) as e:
-            failed[key(u)] = f'(image could not be described: {str(e)[:200]})'
-        print(time.strftime('%m-%d %H:%M:%S'), f"vision {cfg['vision']} {time.time() - t0:.1f}s",
-              'failed' if key(u) in failed else 'ok', file=sys.stderr, flush=True)
+        err = 'no vision model configured'
+        for slug in models:
+            t0, found = time.time(), lookup(cfg, slug)
+            if not found:
+                err = f'unknown vision model {slug}'
+                continue
+            try:  # 转写不需要推理：低推理强度快很多（kimi-k3 实测 50s -> 34s，推理 token 827 -> 6）
+                text, _ = oneshot(*found, {'reasoning': {'effort': 'low'}, 'input': [{'type': 'message', 'role': 'user', 'content': [
+                    {'type': 'input_text', 'text': VISION_PROMPT}, {'type': 'input_image', 'image_url': u}]}]})
+                (HOME / 'vision').mkdir(mode=0o700, parents=True, exist_ok=True)
+                cache(u).write_text(text or '(empty description)')
+                log(f'vision {slug} {time.time() - t0:.1f}s ok ({len(text)} chars)')
+                return
+            except (Upstream, ValueError, KeyError) as e:
+                err = str(e)[:200]
+                log(f'vision {slug} {time.time() - t0:.1f}s failed: {err}')
+        failed[u] = f'(image could not be described: {err})'
 
-    if todo and found:
+    models = cfg['vision'] if isinstance(cfg['vision'], list) else [cfg['vision']]
+    urls = {c['image_url'] for it in req.get('input') or [] for c in parts_of(it)[1]
+            if c.get('type') == 'input_image' and c.get('image_url')}
+    failed = {}
+    todo = [u for u in urls if not cache(u).exists()]
+    if todo:
         with ThreadPoolExecutor(4) as ex:
             list(ex.map(describe, todo))
-    swap = lambda c: c if c.get('type') != 'input_image' else {'type': 'input_text', 'text': (
-        f"[Image described by {cfg['vision']}]\n" + (_seen.get(key(c.get('image_url', ''))) or failed.get(
-            key(c.get('image_url', ''))) or '(no vision model available)'))}
+
+    def swap(c):
+        if c.get('type') != 'input_image':
+            return c
+        u = c.get('image_url', '')
+        text = cache(u).read_text() if cache(u).exists() else failed.get(u, '(image unavailable)')
+        return {'type': 'input_text', 'text': '[Image, transcribed for a text-only model]\n' + text}
+
     items = []
     for it in req.get('input') or []:
         k, ps = parts_of(it)
         items.append({**it, k: [swap(c) for c in ps]} if any(c.get('type') == 'input_image' for c in ps) else it)
     return {**req, 'input': items}
+
+
+def log(msg):
+    print(time.strftime('%m-%d %H:%M:%S'), msg, file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------- HTTP 服务
