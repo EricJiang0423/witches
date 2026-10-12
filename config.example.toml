@@ -30,7 +30,7 @@ max_concurrency = 6       # 可选：同时打到这个上游的请求数，多�
 #           要写的话可以是列表 ["low", "high"]，也可以是表 { low = "low", medium = "high" }（Codex 档位 -> 上游取值，
 #           取值写成表就合并进请求体，比如 { none = { thinking = { type = "disabled" } } }）。每个模型都会自动加上 Codex 的 ultra。
 #   wire 覆盖 provider 的 wire | upstream 上游真实模型名 | extra 合并进请求体的字段
-#   fallback 429/5xx/连不上时依次改用的模型
+#   fallback 429/5xx/连不上时依次改用的模型 | hidden = true 不在 Codex 选择器里显示（只给 vision/fallback 用）
 "glm-5.3" = { context = 200000, fallback = ["mimo/mimo-v2.6-pro"] }
 "kimi-k3" = { context = 262144, images = true }
 "gpt-6.1-sol" = { context = 272000, images = true, wire = "responses" }
@@ -40,4 +40,4 @@ base_url = "https://token-plan-cn.xiaomimimo.com/v1"
 api_key = "tp-..."
 
 [providers.mimo.models]
-"mimo-v2.6-pro" = { context = 1048576, images = true }
+"mimo-v2.6-pro" = { context = 1048576, images = true, hidden = true }   # 只用来看图和兜底

@@ -81,7 +81,7 @@ base_url = "{up}/v1"
 api_key = "k"
 [providers.Fake.models]
 "m1" = {{ context = 1000 }}
-"eye" = {{ images = true }}
+"eye" = {{ images = true, hidden = true }}
 [providers.R]
 base_url = "{up}/r"
 wire = "responses"
@@ -115,6 +115,7 @@ def events(sse):
 ms = json.loads(urllib.request.urlopen(base + '/models?client_version=1').read())['models']
 assert [m['slug'] for m in ms] == ['gpt-x', 'Fake/m1', 'Fake/eye', 'R/g', 'Busy/m2'], ms
 assert ms[1]['input_modalities'] == ['text', 'image']  # 配了 vision，纯文本模型也声明收图
+assert ms[1]['visibility'] == 'list' and ms[2]['visibility'] == 'hide'  # hidden 的看图模型不进选择器
 assert '`m1` model' in ms[1]['base_instructions'] and ms[1]['base_instructions'] != ms[2]['base_instructions']
 
 # 2. GPT 请求：zstd 压缩的原始字节原样转发

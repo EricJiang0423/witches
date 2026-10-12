@@ -94,7 +94,8 @@ def catalog(cfg):
                                                f'Codex Ultra: {top} + proactive subagents'}] if top else []),
                 'multi_agent_reasoning_effort': top, 'multi_agent_version': 'v2',
                 'default_reasoning_summary': 'auto',  # 让 Codex 请求并显示推理摘要（GPT-6 的官方条目是 none）
-                'shell_type': 'unified_exec', 'visibility': 'list', 'supported_in_api': True,
+                # hidden：只给看图/fallback 在后台用，不出现在选择器里（条目保留，用过它的旧线程不受影响）
+                'shell_type': 'unified_exec', 'visibility': 'hide' if m.get('hidden') else 'list', 'supported_in_api': True,
                 'priority': 100 + len(out), 'additional_speed_tiers': [], 'service_tiers': [],
                 'availability_nux': None, 'upgrade': None, 'support_verbosity': False, 'default_verbosity': None,
                 'apply_patch_tool_type': 'freeform', 'truncation_policy': {'mode': 'tokens', 'limit': 10000},
