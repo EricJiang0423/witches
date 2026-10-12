@@ -236,4 +236,12 @@ cfgfile = tmp / 'w' / 'config.toml'
 cfgfile.write_text(cfgfile.read_text().replace('"m1" = {{ context = 1000 }}'.replace('{{', '{').replace('}}', '}'), '"m1" = { context = 2000 }'))
 assert urllib.request.urlopen(base + '/models?client_version=1').headers['ETag'] != tag
 
+# 15. uv 的 Python 用只带小版本号的稳定链接
+d = tmp / 'uvpy'
+(d / 'cpython-3.14.7-linux-x86_64-gnu' / 'bin').mkdir(parents=True)
+(d / 'cpython-3.14.7-linux-x86_64-gnu' / 'bin' / 'python3.14').touch()
+(d / 'cpython-3.14-linux-x86_64-gnu').symlink_to(d / 'cpython-3.14.7-linux-x86_64-gnu')
+assert witches.stable(f'{d}/cpython-3.14.7-linux-x86_64-gnu/bin/python3.14') == f'{d}/cpython-3.14-linux-x86_64-gnu/bin/python3.14'
+assert witches.stable('/opt/homebrew/bin/python3.14') == '/opt/homebrew/bin/python3.14'
+
 print('all checks passed')

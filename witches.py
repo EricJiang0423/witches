@@ -1042,7 +1042,13 @@ def interpreter():
     """常驻服务用的解释器：优先 PATH 里的 python3.14 稳定链接，别写死带补丁版本号的路径（brew upgrade 后会失效）。"""
     venv = (Path(sys.prefix) / 'bin').resolve()  # uv run --script 把临时环境放在 PATH 最前，用完就删，必须跳过
     path = os.pathsep.join(d for d in os.environ.get('PATH', '').split(os.pathsep) if d and Path(d).resolve() != venv)
-    return shutil.which(f'python3.{sys.version_info.minor}', path=path) or getattr(sys, '_base_executable', sys.executable)
+    return stable(shutil.which(f'python3.{sys.version_info.minor}', path=path) or getattr(sys, '_base_executable', sys.executable))
+
+
+def stable(py):
+    """uv 管理的 Python 换成只带小版本号的链接（cpython-3.14.7-… -> cpython-3.14-…，uv 升级补丁版本时会更新它）。"""
+    alt = re.sub(r'cpython-(3\.\d+)\.\d+-', r'cpython-\1-', py, count=1)
+    return alt if alt != py and Path(alt).exists() else py
 
 
 def service(action, port):
