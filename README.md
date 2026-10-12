@@ -88,6 +88,8 @@ max_concurrency = 6
 | Chat 上游 | Responses ↔ Chat Completions 双向翻译：流式输出、并行工具调用、freeform 工具（`apply_patch`）、MCP 命名空间工具、`reasoning_content` 回传（kimi/deepseek 思考模式需要）、推理强度映射 |
 | Responses 上游 | 原样转发，只给条目 id 打 `_wch` 标记、去掉别家的加密推理 |
 | 压缩 | 接住 Codex 的远程压缩（`compaction_trigger`）：把对话转成纯文本交给模型写摘要，再包成 compaction 条目还给 Codex；之后切回 GPT 时自动还原成明文 |
+| 推理档位 | 按官方文档内置各家档位：GLM-5.x / Kimi K3 是 low·high·max，DeepSeek V4 是 none·low·high·max（none 关闭思考），MiMo 是 low·medium·high。Codex 发来不支持的档位时取最近的一档（距离相同往高取），比如给 GLM 发 `medium` 会变成 `high`，因为 GLM 收到 `medium` 会直接报错。每个模型都带 Codex 原生的 **Ultra**：主代理按该模型最高档推理，并由 harness 主动拉起子代理群 |
+| 切换提示 | 线程里换模型后的第一次回答，前面会多一行 `✓ 已切换到 gateway/glm-5.3`（切回 GPT 也有）。这行只给人看，之后发给任何模型前都会删掉；配置里写 `switch_note = false` 可以关掉 |
 | 子代理/审查改派 | `[route]` 按 Codex 的 `x-openai-subagent` 请求头（`collab_spawn` / `guardian` / `review` / `memory_consolidation`）把原本发给 GPT 的请求改派给第三方模型，不用改 Codex 配置 |
 | 看图代理 | 配了 `vision` 后，纯文本模型也会声明能收图；图片（用户贴的截图、`view_image`、浏览器/computer-use 截图）先交给 vision 模型用低推理强度转写成文字（`vision` 可写成列表依次回退），结果按图片哈希缓存在 `~/.witches/vision/`，同一张图只看一次，重启也不用重看。实测一张 1570×1312 的高密度中文截图：kimi-k3 约 33 秒转写完，第二次 1.7 秒 |
 | 429 规避 | `fallback` 遇到 429/5xx/连不上就在首字节前换下一个模型；整条链最多走 3 轮，按 `Retry-After` 或指数退避；`max_concurrency` 让突发请求排队 |
@@ -103,6 +105,8 @@ witches status                 接入状态、服务、各上游连通性、rout
 witches serve [--port N]       前台运行（调试用）
 witches deploy <ssh-host>      同步到远端并安装
 ```
+
+排查问题时可以设置 `WITCHES_DUMP=<目录>` 再前台运行 `witches serve`，每个请求体都会存一份到这个目录（里面是完整对话内容，用完记得删）。
 
 日志在 `~/.witches/witches.log`，每个请求一行：`gpt-6.1-sol -> openai 200`、`gateway/glm-5.3 ok 6.2s`、`vision mimo/mimo-v2.6-pro 6.7s ok`。
 

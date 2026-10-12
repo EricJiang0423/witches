@@ -31,16 +31,19 @@ class Fake(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def reply(self, status, body, ctype='application/json'):
+    def reply(self, status, body, ctype='application/json', headers=()):
         b = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(status)
-        self.send_header('Content-Type', ctype)
+        for k, v in headers:
+            self.send_header(k, v)
+        if ctype:  # 真实的 ChatGPT 后端 SSE 不带 Content-Type
+            self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(b)))
         self.end_headers()
         self.wfile.write(b)
 
     def do_GET(self):
-        self.reply(200, {'models': [{'slug': 'gpt-x'}]})
+        self.reply(200, {'models': [{'slug': 'gpt-x'}]}, headers=[('ETag', 'E1')])
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers['Content-Length']))
@@ -59,7 +62,7 @@ class Fake(BaseHTTPRequestHandler):
                       {'choices': [{'delta': {'tool_calls': [{'index': 0, 'function': {'arguments': ':1}'}}]}, 'finish_reason': 'tool_calls'}]},
                       {'choices': [], 'usage': {'prompt_tokens': 10, 'completion_tokens': 3, 'prompt_tokens_details': {'cached_tokens': 4}}}]
             return self.reply(200, ''.join(f'data: {json.dumps(c)}\n\n' for c in chunks).encode() + b'data: [DONE]\n\n', 'text/event-stream')
-        self.reply(200, b'data: {"type":"response.completed"}\n\n', 'text/event-stream')  # 假 ChatGPT
+        self.reply(200, b'data: {"type":"response.completed"}\n\n', None, [('X-Models-Etag', 'E1')])  # 假 ChatGPT，和真的一样不带 Content-Type
 
 
 fake = ThreadingHTTPServer(('127.0.0.1', 0), Fake)
@@ -195,5 +198,41 @@ assert item['id'] == 'rs_wch_1' and 'encrypted_content' not in item, item
 # 11. 常驻服务的解释器不能是 uv 的临时环境（本测试本身就跑在 uv run --script 的临时环境里）
 py = witches.interpreter()
 assert sys.prefix == sys.base_prefix or not Path(py).resolve().is_relative_to(Path(sys.prefix).resolve()), py
+
+# 12. 切换模型后第一次回答前插一句提示；下一轮不再插，历史里的提示也不发给模型；切回 GPT 时插在原始流前面
+switch = {'type': 'message', 'role': 'developer', 'content': [{'type': 'input_text', 'text': '<model_switch>\nYou are ...'}]}
+q = {'type': 'message', 'role': 'user', 'content': 'q'}
+status, sse = post({'model': 'Fake/m1', 'stream': True, 'input': [q, switch, q]})
+out = events(sse)[-1]['response']['output']
+assert out[0]['content'][0]['text'] == '✓ 已切换到 Fake/m1' and out[1]['type'] == 'reasoning', out
+seen.clear()
+status, sse = post({'model': 'Fake/m1', 'input': [q, switch, q, out[0], {'type': 'message', 'role': 'assistant', 'content': 'a'}, q]})
+assert '已切换到' not in sse and '已切换到' not in seen[0][2].decode(), seen[0][2]
+status, sse = post({'model': 'gpt-x', 'stream': True, 'input': [q, switch, q]})
+assert sse.index('✓ 已切换到 gpt-x') < sse.index('response.completed'), sse
+
+# 13. 推理档位：按模型名套官方预设，每个模型都有 ultra；不支持的档位取最近一档、距离相同往高取
+assert [e['effort'] for e in ms[1]['supported_reasoning_levels']] == ['low', 'medium', 'high', 'ultra']
+assert ms[1]['multi_agent_reasoning_effort'] == 'high' and ms[1]['multi_agent_version'] == 'v2'
+glm, ds, mimo = ({'upstream': u} for u in ('glm-5.3', 'deepseek-v4.1-flash', 'mimo-v2.6-pro'))
+assert [witches.effort(glm, e) for e in ('low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'none')] == \
+    ['low', 'high', 'high', 'max', 'max', 'max', 'low']
+assert witches.effort(mimo, 'max') == 'high' and witches.effort(mimo, 'ultra') == 'high'
+assert witches.effort(ds, 'none') == {'thinking': {'type': 'disabled'}}
+assert witches.effort({'upstream': 'glm-5.3', 'efforts': ['high']}, 'low') == 'high'  # 配置覆盖预设
+
+# 14. 模型列表 ETag 拼上我们目录的哈希，三处一致；改了配置哈希跟着变，Codex 才会重拉列表
+r = urllib.request.urlopen(base + '/models?client_version=1')
+tag = r.headers['ETag']
+assert tag.startswith('E1-w'), tag
+req = urllib.request.Request(base + '/responses', data=json.dumps({'model': 'gpt-x', 'input': []}).encode(),
+                             headers={'Authorization': 'Bearer TOKEN', 'Content-Type': 'application/json'})
+assert urllib.request.urlopen(req).headers['X-Models-Etag'] == tag
+req = urllib.request.Request(base + '/responses', data=json.dumps({'model': 'Fake/m1', 'input': [q]}).encode(),
+                             headers={'Authorization': 'Bearer TOKEN', 'Content-Type': 'application/json'})
+assert urllib.request.urlopen(req).headers['X-Models-Etag'] == tag
+cfgfile = tmp / 'w' / 'config.toml'
+cfgfile.write_text(cfgfile.read_text().replace('"m1" = {{ context = 1000 }}'.replace('{{', '{').replace('}}', '}'), '"m1" = { context = 2000 }'))
+assert urllib.request.urlopen(base + '/models?client_version=1').headers['ETag'] != tag
 
 print('all checks passed')

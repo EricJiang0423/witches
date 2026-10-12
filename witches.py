@@ -82,13 +82,18 @@ def catalog(cfg):
     out = []
     for pname, p in cfg.get('providers', {}).items():
         for mid, m in p.get('models', {}).items():
-            levels = m.get('efforts', ['low', 'medium', 'high'])
+            lv = levels({'upstream': mid, **m})
+            top = next(reversed(lv), None)
             out.append({
                 'slug': f'{pname}/{mid}', 'display_name': m.get('name', f'{pname}/{mid}'),
                 'description': f'{pname}/{mid} via witches', 'base_instructions': identity(pname, mid) + PROMPT,
-                'default_reasoning_level': m.get('default_effort', 'medium' if 'medium' in levels else levels[0])
-                if levels else None,
-                'supported_reasoning_levels': [{'effort': e, 'description': e} for e in levels],
+                'default_reasoning_level': m.get('default_effort', 'high' if 'high' in lv else top),
+                # 每个模型都加 Codex 原生的 ultra：主代理按最高档推理，并由 harness 主动拉起子代理群（需要 multi_agent v2）
+                'supported_reasoning_levels': [{'effort': k, 'description': f'{k} -> {mid} {v if isinstance(v, str) else json.dumps(v)}'}
+                                               for k, v in lv.items()] + ([{'effort': 'ultra', 'description':
+                                               f'Codex Ultra: {top} + proactive subagents'}] if top else []),
+                'multi_agent_reasoning_effort': top, 'multi_agent_version': 'v2',
+                'default_reasoning_summary': 'auto',  # 让 Codex 请求并显示推理摘要（GPT-6 的官方条目是 none）
                 'shell_type': 'unified_exec', 'visibility': 'list', 'supported_in_api': True,
                 'priority': 100 + len(out), 'additional_speed_tiers': [], 'service_tiers': [],
                 'availability_nux': None, 'upgrade': None, 'support_verbosity': False, 'default_verbosity': None,
@@ -100,6 +105,17 @@ def catalog(cfg):
     return out
 
 
+_etag = {'upstream': None}  # 最近一次见到的 ChatGPT 模型列表 ETag
+
+
+def with_tag(etag):
+    """模型列表 ETag 拼上我们目录的哈希：Codex 每次收到回答都拿 X-Models-Etag 和缓存比，一致就只续期不重拉，
+    不拼的话 witches 改了配置/模型，只要还在用 GPT 就永远传不到 Codex。"""
+    if not etag:
+        return None
+    return f"{etag}-w{hashlib.sha256(json.dumps(catalog(config()), sort_keys=True).encode()).hexdigest()[:10]}"
+
+
 def identity(pname, mid):
     """每个模型的系统提示开头写明身份。线程中途换模型时 Codex 会把新模型的系统提示作为 <model_switch> 插进历史，
     不写的话模型会顺着历史里 GPT 的说明自称 GPT；写了，witches 模型之间互切时提示也不同，Codex 才会插入切换说明。"""
@@ -108,16 +124,39 @@ def identity(pname, mid):
             'describe a different model because the user switched models; this instruction takes precedence.\n\n')
 
 
+# 各家官方文档里的思考档位（2026-10 核对，并经 PANTHEON/直连实测）：Codex 档位 -> 上游取值。
+# 取值是字符串就作为 reasoning_effort 发出；是表就合并进请求体（比如关闭思考）。配置里的 efforts 可以覆盖。
+PRESETS = [
+    # Z.ai：GLM-5.3 永远在思考，只收 low/high/max，其他值报错  https://docs.z.ai/guides/capabilities/thinking
+    (r'glm-5', {'low': 'low', 'high': 'high', 'max': 'max'}),
+    # Kimi 平台：K3 永远在思考，low/high/max，默认 max  https://platform.kimi.ai/docs/guide/use-thinking-effort
+    (r'kimi-k3', {'low': 'low', 'high': 'high', 'max': 'max'}),
+    # DeepSeek：low/high/max，默认 high；thinking.type=disabled 关闭思考  https://api-docs.deepseek.com/guides/thinking_mode/
+    (r'deepseek-v4', {'none': {'thinking': {'type': 'disabled'}}, 'low': 'low', 'high': 'high', 'max': 'max'}),
+    # MiMo：直连只收 low/medium/high，xhigh/max 实测 400
+    (r'mimo-v2', {'low': 'low', 'medium': 'medium', 'high': 'high'}),
+]
+
+
+def levels(m):
+    """模型的推理档位：Codex 档位 -> 上游取值，按 Codex 的顺序排。配置 efforts（列表或表）优先，其次按模型名套预设。"""
+    e = m.get('efforts')
+    if e is None:
+        e = next((v for pat, v in PRESETS if re.search(pat, m['upstream'])), ['low', 'medium', 'high'])
+    e = {k: k for k in e} if isinstance(e, list) else e
+    return dict(sorted(e.items(), key=lambda kv: EFFORTS.index(kv[0])))
+
+
 def effort(m, want):
-    """Codex 的推理强度 -> 夹到模型支持的档位 -> effort_map 换成上游取值；None 表示不传。"""
-    levels = m.get('efforts', ['low', 'medium', 'high'])
-    if not want or not levels:
+    """Codex 发来的推理强度 -> 上游取值（字符串或要合并进请求体的表）；None 表示不传。
+    ultra 用最高档（Codex 新版会先自己换成 multi_agent_reasoning_effort）；不支持的档位取最近的一档，距离相同往高取。"""
+    lv = levels(m)
+    if not want or not lv:
         return None
-    if want not in levels:
-        rank = EFFORTS.index(want) if want in EFFORTS else 3
-        lower = [lv for lv in levels if EFFORTS.index(lv) <= rank]
-        want = lower[-1] if lower else levels[0]
-    return m.get('effort_map', {}).get(want, want) or None
+    if want not in lv:
+        rank = len(EFFORTS) if want == 'ultra' else EFFORTS.index(want) if want in EFFORTS else EFFORTS.index('medium')
+        want = min(lv, key=lambda k: (abs(EFFORTS.index(k) - rank), -EFFORTS.index(k)))
+    return lv[want] or None
 
 
 # ---------------------------------------------------------------- 上游连接
@@ -210,6 +249,26 @@ def lift_tools(req):
         for t in it.get('tools', []) if it.get('type') == 'additional_tools' else []:
             tools += t.get('tools', []) if t.get('type') == 'namespace' and t.get('name') == 'functions' else [t]
     return {**req, 'tools': tools, 'input': [i for i in items if i.get('type') != 'additional_tools']}
+
+
+NOTE = '✓ 已切换到 '  # 切换模型后第一次回答前插入的一句提示；只给人看，发给任何模型前都会删掉
+
+
+def note_item(text):
+    return {'type': 'message', 'id': wid('msg'), 'role': 'assistant', 'status': 'completed',
+            'content': [{'type': 'output_text', 'text': text, 'annotations': []}]}
+
+
+def is_note(it):
+    return it.get('type') == 'message' and it.get('role') == 'assistant' and text_of(it.get('content')).startswith(NOTE)
+
+
+def just_switched(items):
+    """刚切换模型后的第一次调用：Codex 插入的最近一条 <model_switch> 之后，还没有任何模型输出。"""
+    idx = [i for i, it in enumerate(items) if it.get('type') == 'message' and it.get('role') == 'developer'
+           and text_of(it.get('content')).lstrip().startswith('<model_switch>')]
+    return bool(idx) and not any(it.get('type') in ('function_call', 'custom_tool_call', 'reasoning')
+                                 or it.get('type') == 'message' and it.get('role') == 'assistant' for it in items[idx[-1] + 1:])
 
 
 def for_openai(items):
@@ -372,7 +431,9 @@ def to_chat(req, p, m):
         if 'parallel_tool_calls' in req:
             body['parallel_tool_calls'] = req['parallel_tool_calls']
     e = effort(m, (req.get('reasoning') or {}).get('effort'))
-    if e:
+    if isinstance(e, dict):
+        body.update(e)
+    elif e:
         body['reasoning_effort'] = e
     if req.get('max_output_tokens'):
         body['max_tokens'] = req['max_output_tokens']
@@ -395,10 +456,11 @@ def to_responses(req, m):
     body['model'] = m['upstream']
     body['input'] = for_third_party(req.get('input') or [])
     e = effort(m, (req.get('reasoning') or {}).get('effort'))
-    if e:
+    if isinstance(e, str):
         body['reasoning'] = {**(req.get('reasoning') or {}), 'effort': e}
     else:
         body.pop('reasoning', None)
+        body.update(e or {})
     body.update(m.get('extra', {}))
     return body
 
@@ -432,11 +494,15 @@ def flatten(items, limit):
 
 # ---------------------------------------------------------------- Chat 流 -> Responses 流
 
-def chat_stream(resp, emit, model, names):
+def chat_stream(resp, emit, model, names, note=None):
     """把上游 Chat SSE 翻译成 Codex 认的 Responses SSE 事件。"""
     rid = 'resp_' + uuid.uuid4().hex
     emit('response.created', {'response': {'id': rid, 'object': 'response', 'status': 'in_progress', 'model': model, 'output': []}})
     done, cur, calls = [], {}, {}  # cur: 正在输出的 reasoning/message
+    if note:
+        done.append(note_item(note))
+        emit('response.output_item.added', {'output_index': 0, 'item': done[0]})
+        emit('response.output_item.done', {'output_index': 0, 'item': done[0]})
     usage, finished = None, False
 
     def close(kind):
@@ -686,6 +752,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         for k, v in headers:
             self.send_header(k, v)
+        if with_tag(_etag['upstream']):
+            self.send_header('X-Models-Etag', with_tag(_etag['upstream']))
         self.send_header('Transfer-Encoding', 'chunked')
         self.end_headers()
 
@@ -700,6 +768,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def emit(self, kind, obj):
         self.chunk(f'event: {kind}\ndata: {json.dumps({"type": kind, **obj}, ensure_ascii=False)}\n\n'.encode())
+
+    def emit_note(self, note):
+        if note:  # 在上游的流之前插一条完整的 assistant 消息（Codex 按 item 收，不看 output_index）
+            item = note_item(note)
+            self.emit('response.output_item.added', {'output_index': 0, 'item': item})
+            self.emit('response.output_item.done', {'output_index': 0, 'item': item})
 
     # -- 路由
 
@@ -724,7 +798,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def passthrough(self, prefix, body, headers=None, label=''):
+    def passthrough(self, prefix, body, headers=None, label='', note=None):
         """原样转发到 OpenAI，响应头和响应体逐字节回传。"""
         h = headers or {k: v for k, v in self.headers.items() if k.lower() not in HOP}
         url = OPENAI[prefix] + self.path[len(prefix):]
@@ -739,6 +813,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.error(502, f'cannot reach {url}: {err}')
         self.send_response(r.status, r.reason)
         for k, v in r.getheaders():
+            if k.lower() == 'x-models-etag':
+                _etag['upstream'] = v
+                v = with_tag(v)
             if k.lower() not in HOP:
                 self.send_header(k, v)
         if r.status in (204, 304) or self.command == 'HEAD':
@@ -747,6 +824,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Transfer-Encoding', 'chunked')
         self.end_headers()
         try:
+            if note and r.status < 300:  # ChatGPT 后端的 SSE 不带 Content-Type，不能靠它判断
+                self.emit_note(note)  # 只在流前面多写几个事件，GPT 的响应本身一个字节不改
             while data := r.read1(65536):
                 self.chunk(data)
             self.end()
@@ -764,7 +843,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(r.status, json.loads(b or b'{}'))
             if r.status < 300:
                 own = json.loads(b)['models']
-                extra = {'ETag': r.getheader('ETag')} if r.getheader('ETag') else {}
+                _etag['upstream'] = r.getheader('ETag') or _etag['upstream']
+                extra = {'ETag': with_tag(r.getheader('ETag'))} if r.getheader('ETag') else {}
         except (OSError, ValueError, KeyError):
             pass
         if own is None:
@@ -798,15 +878,23 @@ class Handler(BaseHTTPRequestHandler):
         cfg = config()
         model = req.get('model', '')
         sub = self.headers.get('x-openai-subagent', '')
+        if os.environ.get('WITCHES_DUMP'):  # 调试：把请求体存下来看 Codex 实际发了什么（含对话内容，用完删掉）
+            Path(os.environ['WITCHES_DUMP']).mkdir(mode=0o700, parents=True, exist_ok=True)
+            (Path(os.environ['WITCHES_DUMP']) / f'{time.time():.3f}-{model.replace("/", "_")}.json').write_bytes(body)
         if '/' not in model and cfg.get('route', {}).get(sub):
             model = cfg['route'][sub]
             req = lift_tools(req)
+        items = req.get('input') if isinstance(req.get('input'), list) else []
+        note = NOTE + model if cfg.get('switch_note', True) and req.get('stream') and just_switched(items) and not any(
+            it.get('type') == 'compaction_trigger' for it in items) else None
+        items = [it for it in items if not is_note(it)]  # 之前插的提示只给人看，不发给模型
         if '/' not in model:  # GPT：只在线程里有 witches 痕迹时改写，否则连压缩过的原始字节一起原样转发
-            items = req.get('input')
-            if isinstance(items, list) and (clean := for_openai(items)) != items:
+            if isinstance(req.get('input'), list) and (clean := for_openai(items)) != req['input']:
                 h = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {'content-encoding'}}
-                return self.passthrough(prefix, json.dumps({**req, 'input': clean}).encode(), h, model + ' (cleaned)')
-            return self.passthrough(prefix, raw, label=model)
+                return self.passthrough(prefix, json.dumps({**req, 'input': clean}).encode(), h, model + ' (cleaned)', note)
+            return self.passthrough(prefix, raw, label=model, note=note)
+        if isinstance(req.get('input'), list):
+            req = {**req, 'input': items}
         if not self.authorized():
             return self.error(403, 'token does not match this machine\'s Codex login')
         if rest == '/responses/compact':
@@ -830,7 +918,8 @@ class Handler(BaseHTTPRequestHandler):
                 if any(it.get('type') == 'compaction_trigger' for it in req.get('input') or []):
                     ok = self.compact(req, p, m, slug, last)
                 else:
-                    ok = self.serve(see(req, cfg) if cfg.get('vision') and not m.get('images') else req, p, m, slug, last)
+                    ok = self.serve(see(req, cfg) if cfg.get('vision') and not m.get('images') else req, p, m, slug, last,
+                                    NOTE + slug if note else None)
             finally:
                 if gate:
                     gate.release()
@@ -852,7 +941,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(e.status, {'error': {'message': f'{slug}: {msg}', 'type': 'upstream_error', 'code': str(e.status)}})
         return True
 
-    def serve(self, req, p, m, slug, last):
+    def serve(self, req, p, m, slug, last, note=None):
         chat = (m.get('wire') or p.get('wire', 'chat')) == 'chat'
         try:
             if chat:
@@ -864,8 +953,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.failed(slug, e, last)
         self.begin()
         if chat:
-            chat_stream(r, self.emit, slug, names)
+            chat_stream(r, self.emit, slug, names, note)
         else:  # Responses 上游：原样转发，只给条目 id 打标记、去掉推理里的加密内容（都是切回 GPT 时会 400 的东西）
+            self.emit_note(note)
             for line in r:
                 if line.startswith(b'data:'):
                     try:

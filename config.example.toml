@@ -1,6 +1,7 @@
 # witches 配置：~/.witches/config.toml
 # 改完立即生效，不用重启服务；新加的模型要新开 Codex 线程（或重启 app-server）才会出现在模型列表里。
 port = 10777
+# switch_note = false     # 关掉"✓ 已切换到 xxx"这行提示（默认开）
 
 # 纯文本模型收到图片时，先交给这个模型转写成文字（低推理强度；按图片哈希缓存在 ~/.witches/vision/）。
 # 可以写成列表，依次回退。不配则纯文本模型不收图。
@@ -25,11 +26,13 @@ max_concurrency = 6       # 可选：同时打到这个上游的请求数，多�
 [providers.gateway.models]
 # 模型选项：
 #   name 显示名 | context 上下文长度 | images 能否直接收图
-#   efforts 推理档位（只能用 Codex 认识的值：low/medium/high/xhigh…）| effort_map 档位 -> 上游取值（"" 表示不传）
+#   efforts 推理档位，一般不用写：glm-5 / kimi-k3 / deepseek-v4 / mimo-v2 会按官方文档自动套用（见 witches.py 的 PRESETS）。
+#           要写的话可以是列表 ["low", "high"]，也可以是表 { low = "low", medium = "high" }（Codex 档位 -> 上游取值，
+#           取值写成表就合并进请求体，比如 { none = { thinking = { type = "disabled" } } }）。每个模型都会自动加上 Codex 的 ultra。
 #   wire 覆盖 provider 的 wire | upstream 上游真实模型名 | extra 合并进请求体的字段
 #   fallback 429/5xx/连不上时依次改用的模型
 "glm-5.3" = { context = 200000, fallback = ["mimo/mimo-v2.6-pro"] }
-"kimi-k3" = { context = 262144, images = true, efforts = ["low", "medium", "high", "xhigh"], effort_map = { medium = "high", xhigh = "max" } }
+"kimi-k3" = { context = 262144, images = true }
 "gpt-6.1-sol" = { context = 272000, images = true, wire = "responses" }
 
 [providers.mimo]
