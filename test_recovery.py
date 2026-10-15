@@ -9,6 +9,8 @@ import http.client
 import io
 import json
 import os
+import select
+import socket
 import tempfile
 import threading
 import time
@@ -48,6 +50,19 @@ class Upstream(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def await_cancel(self, action):
+        action['started'].set()
+        try:
+            if not select.select([self.connection], [], [], 3)[0]:
+                self.server.errors.append('abandoned upstream still open')
+            elif self.connection.recv(1, socket.MSG_PEEK):
+                self.server.errors.append('unexpected upstream bytes')
+        except ConnectionResetError:
+            pass
+        finally:
+            self.close_connection = True
+            action['closed'].set()
+
     def do_POST(self):
         raw = self.rfile.read(int(self.headers['Content-Length']))
         req = json.loads(zstd.decompress(raw) if self.headers.get('Content-Encoding') == 'zstd' else raw)
@@ -60,6 +75,8 @@ class Upstream(BaseHTTPRequestHandler):
             action = actions[min(n, len(actions) - 1)] if actions else {}
         if self.server.block:
             self.server.block.wait(3)
+        if action.get('stall') == 'headers':
+            return self.await_cancel(action)
         status = action.get('status', 200)
         body = action.get('body', CREATED + DONE)
         self.send_response(status)
@@ -72,6 +89,10 @@ class Upstream(BaseHTTPRequestHandler):
         else:
             self.send_header('Content-Length', str(len(body)))
         self.end_headers()
+        if action.get('stall') == 'stream':
+            self.wfile.write(CREATED)
+            self.wfile.flush()
+            return self.await_cancel(action)
         if action.get('drop'):
             if body:
                 self.wfile.write(b'%x\r\n%s\r\n' % (len(body), body))
@@ -122,8 +143,8 @@ class RecoveryTests(unittest.TestCase):
         self.jitter.stop()
         self.assertEqual(self.proxy.errors + self.up.errors, [])
 
-    def cfg(self, extra=''):
-        (witches.HOME / 'config.toml').write_text('[openai]\nmax_concurrency = 3\n' + extra + f'''
+    def cfg(self, extra='', limit=3):
+        (witches.HOME / 'config.toml').write_text(f'[openai]\nmax_concurrency = {limit}\n' + extra + f'''
 [providers.Fake]
 base_url = "http://127.0.0.1:{self.up.server_port}"
 [providers.Fake.models]
@@ -188,6 +209,7 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.up.scripts['gpt-x'] = [{'body': CREATED + BUSY}]
         self.assertEqual(self.post()[1], CREATED + BUSY)
         self.assertEqual(self.up.counts['gpt-x'], 3)
+        self.assertEqual(self.attempt_logs()[-1]['retry_stop'], 'retry_limit')
 
     def test_never_replays_output_or_tool_events(self):
         for output in (OUTPUT, event('response.output_item.added', item={'type': 'function_call', 'name': 'exec'}),
@@ -196,6 +218,7 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
             self.up.scripts['gpt-x'] = [{'body': CREATED + output + BUSY}]
             self.assertEqual(self.post()[1], CREATED + output + BUSY)
             self.assertEqual(self.up.counts['gpt-x'], 1)
+            self.assertEqual(self.attempt_logs()[-1]['retry_stop'], 'output_started')
 
     def test_non_transient_stream_error_is_not_retried(self):
         body = event('response.failed', response={'error': {'code': 'invalid_request_error'}})
@@ -218,6 +241,7 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.up.scripts['gpt-x'] = [{'status': 503, 'body': b'busy', 'headers': {'Retry-After': '120'}}]
         self.assertEqual(self.post()[:2], (503, b'busy'))
         self.assertEqual(self.up.counts['gpt-x'], 1)
+        self.assertEqual(self.attempt_logs()[-1]['retry_stop'], 'retry_window')
         self.cfg('max_retries = 0\n')
         self.up.counts.clear()
         self.up.scripts['gpt-x'] = [{'body': BUSY}]
@@ -236,7 +260,7 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
 
     def test_delay_respects_advice_and_retry_window(self):
         self.up.scripts['gpt-x'] = [{'status': 503, 'body': b'busy', 'headers': {'Retry-After': '7'}}, {}]
-        with patch('witches.time.sleep') as sleep:
+        with patch('witches.ClientWatch.wait') as sleep:
             self.assertEqual(self.post()[0], 200)
         sleep.assert_called_once_with(7)
         self.up.counts.clear()
@@ -403,6 +427,115 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         row = self.attempt_logs()[0]
         self.assertEqual(self.up.counts['gpt-x'], 1)
         self.assertEqual((row['outcome'], row['stage']), ('client_disconnect', 'write_headers'))
+
+    def open_request(self, model='gpt-x'):
+        conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=5)
+        conn.request('POST', '/backend-api/codex/responses', json.dumps({'model': model, 'stream': True}),
+                     {'Content-Type': 'application/json'})
+        return conn
+
+    def test_cancelled_capacity_retry_frees_slot_for_waiting_client(self):
+        self.cfg(limit=1)
+        action = {'stall': 'headers', 'started': threading.Event(), 'closed': threading.Event()}
+        self.up.scripts['gpt-x'] = [{'body': BUSY}, action]
+        conn = self.open_request()
+        try:
+            self.assertTrue(action['started'].wait(2))
+            with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                waiting = pool.submit(self.post, 'gpt-waiting')
+                gate = witches._slots['@openai']
+                deadline = time.monotonic() + 2
+                while gate.waiting != 1 and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertEqual(gate.waiting, 1)
+                conn.close()
+                self.assertTrue(action['closed'].wait(1), 'upstream must close before it produces headers')
+                self.assertEqual(waiting.result(timeout=1)[:2], (200, CREATED + DONE))
+            rows = self.attempt_logs()
+            cancelled = next(r for r in rows if r['outcome'] == 'client_disconnect')
+            self.assertEqual((cancelled['stage'], cancelled['retry_stop']), ('connect', 'client_cancelled'))
+            self.assertEqual(self.up.counts['gpt-x'], 2)
+        finally:
+            conn.close()
+
+    def test_cancel_during_buffered_stream_closes_upstream(self):
+        for headers in ({}, {'Connection': 'close'}):
+            with self.subTest(headers=headers):
+                self.up.counts.clear()
+                self.proxy.logs.clear()
+                action = {'stall': 'stream', 'headers': headers,
+                          'started': threading.Event(), 'closed': threading.Event()}
+                self.up.scripts['gpt-x'] = [action]
+                conn = self.open_request()
+                try:
+                    self.assertTrue(action['started'].wait(2))
+                    conn.close()
+                    self.assertTrue(action['closed'].wait(1))
+                    row = self.attempt_logs()[0]
+                    self.assertEqual((row['outcome'], row['stage'], row['retry_stop']),
+                                     ('client_disconnect', 'read_stream', 'client_cancelled'))
+                    self.assertEqual((row['delivered_bytes'], self.up.counts['gpt-x']), (0, 1))
+                finally:
+                    conn.close()
+
+    def test_cancel_during_retry_after_stops_before_next_attempt(self):
+        self.up.scripts['gpt-x'] = [{'body': BUSY, 'headers': {'Retry-After': '5'}}, {}]
+        conn = self.open_request()
+        try:
+            deadline = time.monotonic() + 2
+            while not self.proxy.logs and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertIn('retry_in', self.proxy.logs[0])
+            conn.close()
+            self.wait_idle()
+            rows = self.attempt_logs()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(self.up.counts['gpt-x'], 1)
+            cancelled = json.loads(next(x.split(' -> openai_cancel ', 1)[1]
+                                        for x in self.proxy.logs if ' -> openai_cancel ' in x))
+            self.assertEqual(cancelled['stage'], 'retry_wait')
+            self.assertEqual(cancelled['chain_id'], rows[0]['chain_id'])
+        finally:
+            conn.close()
+
+    def test_cancel_queued_request_does_not_call_upstream(self):
+        self.cfg(limit=1)
+        gate = witches.slot('@openai', {'max_concurrency': 1})
+        gate.acquire()
+        conn = self.open_request()
+        try:
+            deadline = time.monotonic() + 2
+            while gate.waiting != 1 and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(gate.waiting, 1)
+            conn.close()
+            with gate.condition:
+                self.assertTrue(gate.condition.wait_for(lambda: gate.waiting == 0, timeout=1))
+            self.assertEqual(gate.active, 1)
+            self.assertEqual(self.up.seen, [])
+        finally:
+            conn.close()
+            gate.release()
+
+    def test_live_client_survives_capacity_backoff_and_still_gets_original_stream(self):
+        self.up.scripts['gpt-x'] = [{'body': CREATED + BUSY, 'headers': {'Retry-After': '0.3'}}, {}]
+        self.assertEqual(self.post()[:2], (200, CREATED + DONE))
+        rows = self.attempt_logs()
+        self.assertEqual([r['outcome'] for r in rows], ['stream_error', 'ok'])
+        self.assertGreaterEqual(rows[-1]['elapsed'], .3)
+        self.assertEqual(self.up.counts['gpt-x'], 2)
+
+    def test_client_watch_does_not_consume_pipelined_data(self):
+        server, client = socket.socketpair()
+        try:
+            client.sendall(b'next request')
+            with witches.ClientWatch(server) as watch:
+                watch.wait(.15)
+                self.assertFalse(watch.cancelled.is_set())
+                self.assertEqual(server.recv(12), b'next request')
+        finally:
+            server.close()
+            client.close()
 
     def test_upstream_disconnect_reports_read_stage_and_missing_terminal(self):
         self.up.scripts['gpt-x'] = [{'body': CREATED + OUTPUT, 'drop': True}]

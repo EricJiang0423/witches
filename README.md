@@ -133,6 +133,10 @@ GPT 日志中的 `chain_id` 关联同一请求的全部尝试，`request_id` 是
 
 `max_concurrency = 0` 关闭并发限制，`max_retries = 0` 关闭 GPT 内部重试。并发设置可热更新；`retry_window` 限制安排重试的时间，不限制一次已开始的模型生成。多台机器或多个 witches 进程共用账号时，需要自行协调总并发。
 
+GPT 请求会在排队、连接/读取上游及重试退避期间监视客户端连接。Codex 取消任务并断开连接后，witches 停止后续重试、shutdown 已建立的上游 socket，及时释放并发名额；不再等模型输出后才通过 BrokenPipe 发现取消。监视器不读取后续请求内容，不提前发送 HTTP 头或改写 SSE，也不限制仍在线客户端的正常生成时长。尚未建立 socket 的 DNS/连接阶段仍受系统连接超时约束，返回后会再次检查取消。
+
+尝试日志的 `retry_stop` 区分 `client_cancelled`（观测到下游 EOF/RST）、`client_write_failed`（写回失败）、`retry_limit`、`retry_window` 和 `output_started`。排队/退避期间取消单独记录 `-> openai_cancel`，`stage` 为 `queue` / `retry_wait`；退避取消携带相同的 `chain_id`，不会被计作一次新的上游尝试。客户端主动取消不代表容量重试已耗尽，也不能据 BrokenPipe 的时间推断客户端的实际超时时间。
+
 本机 `GET /health` 返回进程 PID、GPT 配置及 `active` / `waiting` / `runtime_limit`，可用于重启后核验运行进程、并发和排队。配置值来自当前文件，`runtime_limit` 是上一次 GPT 请求应用的上限；仅检查健康不会修改闸门或触发模型请求。
 
 ## 已知限制
