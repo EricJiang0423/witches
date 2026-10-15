@@ -17,7 +17,9 @@ import json
 import os
 import random
 import re
+import select
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -206,7 +208,76 @@ def private_ip(host):
     return ip.is_private or ip.is_loopback or ip in ipaddress.ip_network('100.64.0.0/10')
 
 
-def fetch(method, url, body=None, headers=None, timeout=900):
+class ClientDisconnected(OSError):
+    """下游已取消；不能按上游故障重试。"""
+
+
+class RetryUpstream(Exception):
+    """结束本次上游尝试，关闭连接后再退避。"""
+
+
+class ClientWatch:
+    """请求体读完后监视下游 EOF/RST，不消费 keep-alive/pipeline 的下一条请求。
+
+    只 shutdown 上游 socket 来唤醒阻塞 I/O；HTTPResponse 的关闭仍由请求线程负责，
+    避免跨线程 close 缓冲 reader 的锁。连接建立期间也持续检查新出现的 socket。
+    """
+    def __init__(self, client):
+        self.client, self.upstream, self.upstream_socket = client, None, None
+        self.cancelled, self.done = threading.Event(), threading.Event()
+        self.lock = threading.Lock()
+        self.poller = select.poll()  # 不受 select() 的 FD_SETSIZE 限制
+        self.poller.register(client, select.POLLIN)
+        self.thread = threading.Thread(target=self.watch, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.done.set()
+        self.thread.join()
+
+    def check(self):
+        with self.lock:
+            if not self.cancelled.is_set():
+                try:
+                    if self.poller.poll(0) and not self.client.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
+                        self.cancelled.set()
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    self.cancelled.set()
+        if self.cancelled.is_set():
+            raise ClientDisconnected()
+
+    def bind(self, conn):
+        with self.lock:
+            self.upstream = conn
+            self.upstream_socket = conn.sock
+        self.check()
+
+    def watch(self):
+        while not self.done.wait(.1):
+            try:
+                self.check()
+            except ClientDisconnected:
+                with self.lock:
+                    sock = (self.upstream.sock or self.upstream_socket) if self.upstream is not None else None
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+    def wait(self, seconds):
+        self.check()
+        if self.cancelled.wait(seconds):
+            raise ClientDisconnected()
+        self.check()
+
+
+def fetch(method, url, body=None, headers=None, timeout=900, cancel=None):
     """http.client 发请求；尊重 http(s)_proxy/no_proxy，私网 IP（含 Tailscale 100.64/10）总是直连。"""
     u = urllib.parse.urlsplit(url)
     https = u.scheme == 'https'
@@ -234,6 +305,10 @@ def fetch(method, url, body=None, headers=None, timeout=900):
     else:
         conn = http.client.HTTPConnection(u.hostname, port, timeout=timeout)
     try:
+        if cancel is not None:
+            cancel.bind(conn)
+            conn.connect()
+            cancel.bind(conn)  # getresponse() 可能把 Connection: close 的 socket 从 conn 分离
         conn.request(method, path, body=body, headers=headers or {})
         return Response(conn.getresponse(), conn)
     except BaseException:
@@ -256,12 +331,21 @@ class Gate:
             self.limit = max(0, int(limit))
             self.condition.notify_all()
 
-    def acquire(self, timeout=None):
+    def acquire(self, timeout=None, cancel=None):
         with self.condition:
             self.waiting += 1
             try:
-                if not self.condition.wait_for(lambda: not self.limit or self.active < self.limit, timeout):
-                    return False
+                deadline = None if timeout is None else time.monotonic() + timeout
+                while True:
+                    if cancel is not None:
+                        cancel.check()
+                    if not self.limit or self.active < self.limit:
+                        break
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        return False
+                    self.condition.wait((min(remaining, .1) if remaining is not None else .1)
+                                        if cancel is not None else remaining)
                 self.active += 1
                 return True
             finally:
@@ -1012,7 +1096,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.error(502, 'upstream disconnected before response headers', 'upstream_disconnect')
 
-    def passthrough(self, prefix, body, headers=None, label='', note=None, recovery=None):
+    def passthrough(self, prefix, body, headers=None, label='', note=None, recovery=None, cancel=None):
         """GPT 首次输出前有限重试；其他路径只重试连接异常。所有响应保留原始字节。"""
         h = headers or {k: v for k, v in self.headers.items() if k.lower() not in HOP}
         # 需要检查 SSE 的 GPT 请求使用明文响应，原始请求（包括 zstd）仍原样转发。
@@ -1026,10 +1110,15 @@ class Handler(BaseHTTPRequestHandler):
         window = max(0, float((recovery or {}).get('retry_window', 60)))
 
         def delay(attempt, advice=None):
+            nonlocal retry_stop
             wait = retry_after(advice)
             if wait is None:
                 wait = random.uniform(0.5, 1) * min(2 ** (attempt + 1), 15)
-            if attempt >= retries or time.monotonic() - started + wait >= window:
+            if attempt >= retries:
+                retry_stop = 'retry_limit'
+                return None
+            if time.monotonic() - started + wait >= window:
+                retry_stop = 'retry_window'
                 return None
             return wait
 
@@ -1039,6 +1128,7 @@ class Handler(BaseHTTPRequestHandler):
             request_id = '-'
             stage, error_class, delivered = 'connect', None, 0
             truncated_after_terminal = False
+            retry_stop = None
 
             def begin():
                 nonlocal committed, stage, delivered
@@ -1065,7 +1155,9 @@ class Handler(BaseHTTPRequestHandler):
                     pending.clear()
 
             try:
-                r = fetch(self.command, url, body or None, h)
+                if cancel is not None:
+                    cancel.check()
+                r = fetch(self.command, url, body or None, h, **({'cancel': cancel} if cancel is not None else {}))
                 request_id = r.getheader('x-request-id') or r.getheader('x-oai-request-id') or '-'
                 inspect = recovery is not None and self.path.split('?')[0].endswith('/responses') and \
                     r.status == 200 and (r.getheader('Content-Encoding') or 'identity').lower() == 'identity' and \
@@ -1083,7 +1175,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not {str(err.get('code', '')), str(err.get('type', ''))} & QUOTA_CODES:
                         wait = delay(attempt, r.getheader('Retry-After'))
                     if wait is not None:
-                        continue
+                        raise RetryUpstream()
                 if r.status in (204, 304) or self.command == 'HEAD':
                     begin()
                     return
@@ -1091,6 +1183,8 @@ class Handler(BaseHTTPRequestHandler):
                     begin()
                 while True:
                     stage = 'read_stream'
+                    if cancel is not None:
+                        cancel.check()
                     try:
                         data = r.read1(65536)
                     except STREAM_ERRORS:
@@ -1119,17 +1213,21 @@ class Handler(BaseHTTPRequestHandler):
                         self.chunk(data)
                         delivered += len(data)
                 if wait is not None:
-                    continue
+                    raise RetryUpstream()
                 if not committed:
                     begin()
                 stage = 'write_end'
                 self.end()
                 return
+            except RetryUpstream:
+                pass
             except STREAM_ERRORS as e:
                 error_class = type(e).__name__
-                outcome = 'client_disconnect' if stage.startswith('write_') else 'disconnect'
+                client_cancelled = cancel is not None and cancel.cancelled.is_set()
+                outcome = 'client_disconnect' if client_cancelled or stage.startswith('write_') else 'disconnect'
                 # 客户端取消不重放；上游断流只允许在首次交付前恢复。
-                if stage.startswith('write_') or committed or self.response_started:
+                if client_cancelled or stage.startswith('write_') or committed or self.response_started:
+                    wait = None
                     self.close_connection = True
                     return
                 wait = delay(attempt) if recovery is not None or r is None else None
@@ -1145,6 +1243,14 @@ class Handler(BaseHTTPRequestHandler):
                           'chain_id': chain_id, 'stage': stage, 'error_class': error_class,
                           'terminal': probe.terminal_kind, 'delivered_bytes': delivered,
                           'elapsed': round(time.monotonic() - started, 3)}
+                if cancel is not None and cancel.cancelled.is_set():
+                    retry_stop = 'client_cancelled'
+                elif outcome == 'client_disconnect':
+                    retry_stop = 'client_write_failed'
+                elif probe.failure is not None and transient_error(probe.failure) and probe.output:
+                    retry_stop = 'output_started'
+                if retry_stop is not None:
+                    fields['retry_stop'] = retry_stop
                 if truncated_after_terminal:
                     fields['truncated_after_terminal'] = True
                 if probe.failure is not None:
@@ -1160,21 +1266,39 @@ class Handler(BaseHTTPRequestHandler):
                 self.log(f'{label} -> openai ' + json.dumps(fields, ensure_ascii=False))
                 if r is not None:
                     r.close()
-                if wait is not None:
+            if wait is not None:
+                if cancel is None:
                     time.sleep(wait)
+                else:
+                    try:
+                        cancel.wait(wait)
+                    except ClientDisconnected:
+                        self.close_connection = True
+                        self.log(f'{label} -> openai_cancel ' + json.dumps({
+                            'chain_id': chain_id, 'attempt': attempt + 1, 'stage': 'retry_wait',
+                            'retry_stop': 'client_cancelled', 'elapsed': round(time.monotonic() - started, 3)}))
+                        return
 
     def gpt(self, prefix, body, cfg, headers=None, label='', note=None):
         opts = openai_options(cfg)
         gate = slot('@openai', opts)
         t0 = time.monotonic()
-        if not gate.acquire(timeout=max(0, float(opts['queue_timeout']))):
-            self.log(f'{label} openai_queue_timeout waited={time.monotonic() - t0:.3f}s')
-            return self.send_json(503, {'error': {'code': 'witches_queue_timeout', 'type': 'witches_error',
-                                  'message': 'witches: GPT concurrency queue timed out'}}, {'Retry-After': '2'})
-        try:
-            return self.passthrough(prefix, body, headers, label, note, recovery=opts)
-        finally:
-            gate.release()
+        with ClientWatch(self.connection) as cancel:
+            try:
+                acquired = gate.acquire(timeout=max(0, float(opts['queue_timeout'])), cancel=cancel)
+            except ClientDisconnected:
+                self.close_connection = True
+                self.log(f'{label} -> openai_cancel ' + json.dumps({
+                    'stage': 'queue', 'retry_stop': 'client_cancelled', 'elapsed': round(time.monotonic() - t0, 3)}))
+                return
+            if not acquired:
+                self.log(f'{label} openai_queue_timeout waited={time.monotonic() - t0:.3f}s')
+                return self.send_json(503, {'error': {'code': 'witches_queue_timeout', 'type': 'witches_error',
+                                      'message': 'witches: GPT concurrency queue timed out'}}, {'Retry-After': '2'})
+            try:
+                return self.passthrough(prefix, body, headers, label, note, recovery=opts, cancel=cancel)
+            finally:
+                gate.release()
 
     def models(self, prefix):
         """ChatGPT 的模型列表 + 我们的模型。上游不可用时用 Codex 自己缓存的列表兜底。"""
