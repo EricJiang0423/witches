@@ -93,6 +93,7 @@ max_concurrency = 6
 | 功能 | 说明 |
 |---|---|
 | Chat 上游 | Responses ↔ Chat Completions 双向翻译：流式输出、并行工具调用、freeform 工具（`apply_patch`）、MCP 命名空间工具、`reasoning_content` 回传（kimi/deepseek 思考模式需要）、推理强度映射 |
+| 明文代理通信 | Chat 模型生成的 `collaboration.spawn_agent` / `send_message` / `followup_task` 调用显式带 `encrypted_function_args = []`，符合 Codex 的明文参数协议，避免把普通代理消息存成密文后触发审批解密失败。GPT 透传、原生 Responses 上游及已有加密标记保持原样 |
 | Responses 上游 | 原样转发，只给条目 id 打 `_wch` 标记、去掉别家的加密推理 |
 | 压缩 | 接住 Codex 的远程压缩（`compaction_trigger`）：把对话转成纯文本交给模型写摘要，再包成 compaction 条目还给 Codex；之后切回 GPT 时自动还原成明文 |
 | 推理档位 | 按官方文档内置各家档位：GLM-5.x / Kimi K3 是 low·high·max，DeepSeek V4 是 none·low·high·max（none 关闭思考），MiMo 是 low·medium·high。Codex 发来不支持的档位时取最近的一档（距离相同往高取），比如给 GLM 发 `medium` 会变成 `high`，因为 GLM 收到 `medium` 会直接报错。每个模型都带 Codex 原生的 **Ultra**：主代理按该模型最高档推理，并由 harness 主动拉起子代理群 |
@@ -125,6 +126,8 @@ gpt-6.1-sol -> openai {"http": 200, "outcome": "stream_error", "attempt": 1, "co
 流诊断不记录对话、错误 message、凭据或 Cookie。第三方模型仍有 `gateway/glm-5.3 ok 6.2s` 和看图转写日志，流内失败单独记为 `stream_error`。排队超时使用独立的 `witches_queue_timeout`，与上游满载区分。
 
 GPT 日志中的 `chain_id` 关联同一请求的全部尝试，`request_id` 是每次尝试的上游 ID。`stage`、`error_class`、`terminal` 和 `delivered_bytes` 用于区分上游连接/读取异常与客户端写入失败（`client_disconnect`）；客户端取消不重放。`response.incomplete` 单独记为 `incomplete`，不会记成成功。`invalid_encrypted_content` 额外记录加密字段的结构计数及合法的 `input` 字段路径，不记录或删除加密内容，不修改审批策略。
+
+明文代理通信修复只影响新生成的 Chat 工具调用；不会把历史中的 `encrypted_content` 猜测转换成明文。已经保存了错误密文类型的旧审批上下文，仍可能需要由 Codex 重建。
 
 只缓冲 `response.created` / `in_progress` / `queued` 和心跳等启动事件，缓冲上限 256 KiB；任何输出条目（包括推理、工具）、未知事件或超出缓冲上限都会提交响应，此后代理不再重放。授权、配额耗尽和无效请求错误不因流内重试而掩盖。完整终态前断流时关闭客户端连接，不伪造成功结束，让 Codex 识别截断；已经收到完整终态时，即使上游缺 HTTP 结束块，也不重放。
 

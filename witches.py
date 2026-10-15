@@ -680,6 +680,17 @@ def flatten(items, limit):
 
 # ---------------------------------------------------------------- Chat 流 -> Responses 流
 
+def plaintext_collaboration(item):
+    """显式声明普通协作参数为明文，避免 Codex 缺省把代理消息当成密文。
+    参见 openai/codex rust-v0.162.1 core/src/tools/router.rs ToolCall::direct_source。
+    保留已有的密文参数标记，不检查或重写消息内容。
+    """
+    if item.get('type') == 'function_call' and item.get('namespace') == 'collaboration' and \
+            item.get('name') in ('spawn_agent', 'send_message', 'followup_task'):
+        item.setdefault('encrypted_function_args', [])
+    return item
+
+
 def chat_stream(resp, emit, model, names, note=None):
     """把上游 Chat SSE 翻译成 Codex 认的 Responses SSE 事件。"""
     rid = 'resp_' + uuid.uuid4().hex
@@ -780,6 +791,7 @@ def chat_stream(resp, emit, model, names, note=None):
                     'arguments': c['args'] or '{}', 'status': 'completed'}
         if ns:
             item['namespace'] = ns
+        plaintext_collaboration(item)
         idx = len(done)
         emit('response.output_item.added', {'output_index': idx, 'item': item})
         done.append(item)

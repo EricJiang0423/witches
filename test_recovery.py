@@ -6,6 +6,7 @@
 import concurrent.futures
 import datetime
 import http.client
+import io
 import json
 import os
 import tempfile
@@ -435,6 +436,49 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.assertEqual(row['encryption_shape']['reasoning'], 1)
         self.assertEqual(row['error_param'], 'input[1].content[0].encrypted_content')
         self.assertNotIn('PRIVATE_', json.dumps(row))
+
+    def test_chat_collaboration_calls_explicitly_mark_plaintext_arguments(self):
+        for name in ('spawn_agent', 'send_message', 'followup_task'):
+            args = json.dumps({'message': '普通代理消息：保留原文。'}, ensure_ascii=False)
+            chunk = {'choices': [{'delta': {'tool_calls': [{'index': 0, 'function': {
+                'name': 'collab', 'arguments': args}}]}, 'finish_reason': 'tool_calls'}]}
+            body = b'data: ' + json.dumps(chunk).encode() + b'\n\ndata: [DONE]\n\n'
+            emitted = []
+            witches.chat_stream(io.BytesIO(body), lambda kind, obj: emitted.append((kind, obj)),
+                                'Fake/chat', {'collab': ('function', 'collaboration', name)})
+            items = [obj['item'] for kind, obj in emitted if kind in (
+                'response.output_item.added', 'response.output_item.done')]
+            items += emitted[-1][1]['response']['output']
+            self.assertEqual(len(items), 3)
+            for item in items:
+                self.assertEqual(item['encrypted_function_args'], [])
+                self.assertEqual((item['namespace'], item['name'], item['arguments']), ('collaboration', name, args))
+
+    def test_plaintext_marker_is_limited_to_collaboration_message_tools(self):
+        for kind, ns, name in [('function_call', 'functions', 'exec_command'),
+                               ('function_call', 'mcp__gh', 'send_message'),
+                               ('function_call', 'collaboration', 'list_agents'),
+                               ('custom_tool_call', 'collaboration', 'send_message')]:
+            original = {'type': kind, 'namespace': ns, 'name': name, 'arguments': '{}'}
+            self.assertEqual(witches.plaintext_collaboration(dict(original)), original)
+        protected = {'type': 'function_call', 'namespace': 'collaboration', 'name': 'send_message',
+                     'encrypted_function_args': ['message'], 'arguments': '{"message":"OPAQUE"}'}
+        self.assertEqual(witches.plaintext_collaboration(dict(protected)), protected)
+
+    def test_native_responses_and_gpt_encryption_markers_remain_unchanged(self):
+        for marker in ('absent', None, [], ['message']):
+            item = {'type': 'function_call', 'namespace': 'collaboration', 'name': 'send_message',
+                    'call_id': 'call_1', 'arguments': '{"message":"OPAQUE"}'}
+            if marker != 'absent':
+                item['encrypted_function_args'] = marker
+            body = event('response.output_item.done', item=item) + event('response.completed', response={'output': [item]})
+            self.up.scripts['responses'] = [{'body': body}]
+            response = self.post('Fake/responses')[1]
+            parsed = [json.loads(line[6:]) for line in response.splitlines() if line.startswith(b'data: ')]
+            self.assertEqual(parsed[0]['item'], item)
+            self.assertEqual(parsed[-1]['response']['output'][0], item)
+            self.up.scripts['gpt-x'] = [{'body': body}]
+            self.assertEqual(self.post()[1], body)
 
 
 if __name__ == '__main__':
