@@ -15,6 +15,7 @@ import http.client
 import ipaddress
 import json
 import os
+import random
 import re
 import shutil
 import ssl
@@ -28,6 +29,7 @@ import urllib.request
 import uuid
 from compression import zstd
 from concurrent.futures import ThreadPoolExecutor
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -43,6 +45,12 @@ HOP = {'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upg
        'content-length', 'host'}
 EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 RETRYABLE = {408, 409, 429, 500, 502, 503, 504, 529}
+CAPACITY_CODES = {'server_overloaded', 'server_is_overloaded', 'model_overloaded', 'overloaded_error',
+                  'rate_limit_exceeded', 'slow_down'}
+QUOTA_CODES = {'insufficient_quota', 'quota_exhausted', 'billing_hard_limit_reached',
+               'project_spend_limit_exceeded', 'organization_usage_limit_exceeded'}
+STREAM_ERRORS = (OSError, http.client.HTTPException)
+PRELUDE_LIMIT = 262144
 PROMPT = Path(__file__).resolve().with_name('prompt.md').read_text()  # Codex 的基础提示词（openai/codex，Apache-2.0）
 
 # Codex 自己的压缩提示词与摘要前缀（openai/codex，Apache-2.0）
@@ -165,6 +173,30 @@ def effort(m, want):
 _ctx = ssl.create_default_context()
 
 
+class Response:
+    """HTTPResponse 和创建它的连接一起关闭，避免 keep-alive socket 留给 GC。"""
+    def __init__(self, response, connection):
+        self.response, self.connection = response, connection
+
+    def __getattr__(self, name):
+        return getattr(self.response, name)
+
+    def __iter__(self):
+        return iter(self.response)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def close(self):
+        try:
+            self.response.close()
+        finally:
+            self.connection.close()
+
+
 def private_ip(host):
     try:
         ip = ipaddress.ip_address(host.strip('[]'))
@@ -200,21 +232,113 @@ def fetch(method, url, body=None, headers=None, timeout=900):
         conn = http.client.HTTPSConnection(u.hostname, port, timeout=timeout, context=_ctx)
     else:
         conn = http.client.HTTPConnection(u.hostname, port, timeout=timeout)
-    conn.request(method, path, body=body, headers=headers or {})
-    return conn.getresponse()
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        return Response(conn.getresponse(), conn)
+    except BaseException:
+        conn.close()
+        raise
 
 
 _slots = {}
 _slots_lock = threading.Lock()
 
 
+class Gate:
+    """可热更新的进程内并发闸门；缩小上限不影响已在运行的请求。"""
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.active, self.limit = 0, 0
+
+    def resize(self, limit):
+        with self.condition:
+            self.limit = max(0, int(limit))
+            self.condition.notify_all()
+
+    def acquire(self, timeout=None):
+        with self.condition:
+            if not self.condition.wait_for(lambda: not self.limit or self.active < self.limit, timeout):
+                return False
+            self.active += 1
+            return True
+
+    def release(self):
+        with self.condition:
+            self.active -= 1
+            self.condition.notify_all()
+
+
 def slot(pname, p):
     """每个 provider 的并发闸门（max_concurrency），突发的子代理请求排队而不是一起打到上游。"""
-    n = p.get('max_concurrency', 0)
-    if not n:
-        return None
     with _slots_lock:
-        return _slots.setdefault(pname, threading.BoundedSemaphore(n))
+        gate = _slots.setdefault(pname, Gate())
+        gate.resize(p.get('max_concurrency', 0))
+        return gate
+
+
+def retry_after(value):
+    """Retry-After 支持秒数和 HTTP 日期；不会缩短服务端要求的等待时间。"""
+    if value is None:
+        return None
+    try:
+        return max(0, float(value))
+    except (TypeError, ValueError):
+        try:
+            return max(0, parsedate_to_datetime(value).timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def error_fields(event):
+    response = event.get('response')
+    err = event.get('error') or (response.get('error') if isinstance(response, dict) else None) or {}
+    return err if isinstance(err, dict) else {'code': 'upstream_error'}
+
+
+def transient_error(err):
+    codes = {str(err.get('code', '')), str(err.get('type', ''))}
+    return not codes & QUOTA_CODES and bool(codes & CAPACITY_CODES)
+
+
+class StreamProbe:
+    """旁路检查 SSE，原始字节不重编码。只缓冲已知的启动事件，未知事件保守地提交。"""
+    def __init__(self):
+        self.buffer = b''
+        self.output = self.terminal = self.opaque = False
+        self.failure = None
+
+    def feed(self, data):
+        self.buffer += data
+        while match := re.search(rb'\r\n\r\n|\r\n\n|\n\r\n|\n\n|\r\r', self.buffer):
+            frame, self.buffer = self.buffer[:match.start()], self.buffer[match.end():]
+            if self.opaque or len(frame) > PRELUDE_LIMIT:
+                self.opaque = False
+                self.output = True
+                continue
+            lines = re.split(rb'\r\n|\r|\n', frame)
+            values = [ln[5:].lstrip(b' ') for ln in lines if ln.startswith(b'data:')]
+            if not values:  # 注释/心跳
+                continue
+            try:
+                event = json.loads(b'\n'.join(values))
+                if not isinstance(event, dict):
+                    raise ValueError('non-object SSE data')
+            except ValueError:
+                self.output = True
+                continue
+            kind = event.get('type') or next((ln[6:].strip().decode('utf-8', 'replace') for ln in lines
+                                             if ln.startswith(b'event:')), '')
+            if kind in ('response.failed', 'error') or event.get('error'):
+                self.failure = error_fields(event)
+                self.terminal = True
+            elif kind in ('response.completed', 'response.incomplete'):
+                self.terminal = self.output = True
+            elif kind not in ('response.created', 'response.in_progress', 'response.queued', 'ping') or \
+                    (isinstance(event.get('response'), dict) and event['response'].get('output')):
+                self.output = True
+        if len(self.buffer) > PRELUDE_LIMIT:
+            self.opaque = self.output = True
+            self.buffer = b''
 
 
 # ---------------------------------------------------------------- 请求整理
@@ -577,7 +701,7 @@ def chat_stream(resp, emit, model, names, note=None):
             if ch.get('finish_reason'):
                 finished = True
     if not finished:  # 上游断流：不发 completed，让 Codex 自己重试
-        return
+        raise http.client.IncompleteRead(b'')
     close('reasoning')
     close('message')
     for _, c in sorted(calls.items()):
@@ -624,10 +748,13 @@ def call_upstream(p, body, path):
     h = {'Content-Type': 'application/json', 'Authorization': f"Bearer {p.get('api_key', '')}", **p.get('headers', {})}
     try:
         r = fetch('POST', p['base_url'].rstrip('/') + path, json.dumps(body, ensure_ascii=False).encode(), h)
-    except OSError as e:
+    except STREAM_ERRORS as e:
         raise Upstream(502, f'cannot reach {p["base_url"]}: {e}')
     if r.status >= 400:
-        raise Upstream(r.status, r.read()[:2000].decode('utf-8', 'replace'), r.getheader('Retry-After'))
+        try:
+            raise Upstream(r.status, r.read(2000).decode('utf-8', 'replace'), r.getheader('Retry-After'))
+        finally:
+            r.close()
     return r
 
 
@@ -637,9 +764,11 @@ def oneshot(p, m, req):
         body, _ = to_chat(req, p, m)
         body['stream'] = False
         body.pop('stream_options', None)
-        res = json.loads(call_upstream(p, body, '/chat/completions').read())
+        with call_upstream(p, body, '/chat/completions') as r:
+            res = json.loads(r.read())
         return (res['choices'][0]['message'].get('content') or '').strip(), responses_usage(res.get('usage'))
-    res = json.loads(call_upstream(p, {**to_responses(req, m), 'stream': False}, '/responses').read())
+    with call_upstream(p, {**to_responses(req, m), 'stream': False}, '/responses') as r:
+        res = json.loads(r.read())
     text = '\n'.join(text_of(o.get('content')) for o in res.get('output', []) if o.get('type') == 'message')
     return text.strip(), res.get('usage')
 
@@ -682,7 +811,7 @@ def see(req, cfg):
                 cache(u).write_text(text or '(empty description)')
                 log(f'vision {slug} {time.time() - t0:.1f}s ok ({len(text)} chars)')
                 return
-            except (Upstream, ValueError, KeyError) as e:
+            except (Upstream, OSError, http.client.HTTPException, ValueError, KeyError) as e:
                 err = str(e)[:200]
                 log(f'vision {slug} {time.time() - t0:.1f}s failed: {err}')
         failed[u] = f'(image could not be described: {err})'
@@ -735,6 +864,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- 输出
 
+    def end_headers(self):
+        self.response_started = True
+        super().end_headers()
+
     def send_json(self, status, obj, headers=None):
         b = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(status)
@@ -779,6 +912,7 @@ class Handler(BaseHTTPRequestHandler):
     # -- 路由
 
     def route(self):
+        self.response_started = False
         t0 = time.time()
         n = int(self.headers.get('Content-Length') or 0)
         raw = self.rfile.read(n) if n else b''  # 先读完请求体，keep-alive 连接上的下一个请求才不会错位
@@ -797,46 +931,157 @@ class Handler(BaseHTTPRequestHandler):
                 return self.responses_api(prefix, rest, raw, t0)
             return self.passthrough(prefix, raw)
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            self.close_connection = True
+        except STREAM_ERRORS as e:
+            self.log(f'upstream_disconnect error={type(e).__name__} committed={self.response_started}')
+            if self.response_started:
+                self.close_connection = True  # 不发正常结束块，Codex 才能识别截断；不再写第二组 HTTP 头
+            else:
+                self.error(502, 'upstream disconnected before response headers', 'upstream_disconnect')
 
-    def passthrough(self, prefix, body, headers=None, label='', note=None):
-        """原样转发到 OpenAI，响应头和响应体逐字节回传。"""
+    def passthrough(self, prefix, body, headers=None, label='', note=None, recovery=None):
+        """GPT 首次输出前有限重试；其他路径只重试连接异常。所有响应保留原始字节。"""
         h = headers or {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        # 需要检查 SSE 的 GPT 请求使用明文响应，原始请求（包括 zstd）仍原样转发。
+        if recovery is not None:
+            h = {k: v for k, v in h.items() if k.lower() != 'accept-encoding'}
+            h['Accept-Encoding'] = 'identity'
         url = OPENAI[prefix] + self.path[len(prefix):]
-        for attempt in range(3):  # 本地代理偶尔在 TLS 握手时断开（SSL EOF / reset），连接级错误原地重试
+        started = time.monotonic()
+        retries = max(0, int((recovery or {}).get('max_retries', 2)))
+        window = max(0, float((recovery or {}).get('retry_window', 60)))
+
+        def delay(attempt, advice=None):
+            wait = retry_after(advice)
+            if wait is None:
+                wait = random.uniform(0.5, 1) * min(2 ** (attempt + 1), 15)
+            if attempt >= retries or time.monotonic() - started + wait >= window:
+                return None
+            return wait
+
+        for attempt in range(retries + 1):
+            r, pending, committed, wait = None, bytearray(), False, None
+            probe, outcome = StreamProbe(), 'ok'
+            request_id = '-'
+
+            def begin():
+                nonlocal committed
+                self.send_response(r.status, r.reason)
+                for k, v in r.getheaders():
+                    if k.lower() == 'x-models-etag':
+                        _etag['upstream'] = v
+                        v = with_tag(v)
+                    if k.lower() not in HOP:
+                        self.send_header(k, v)
+                no_body = r.status in (204, 304) or self.command == 'HEAD'
+                if not no_body:
+                    self.send_header('Transfer-Encoding', 'chunked')
+                self.end_headers()
+                committed = True
+                if note and r.status < 300 and not no_body:
+                    self.emit_note(note)
+                if pending:
+                    self.chunk(bytes(pending))
+                    pending.clear()
+
             try:
                 r = fetch(self.command, url, body or None, h)
-                break
-            except OSError as e:
-                err = e
-                time.sleep(0.5 * (attempt + 1))
-        else:
-            return self.error(502, f'cannot reach {url}: {err}')
-        self.send_response(r.status, r.reason)
-        for k, v in r.getheaders():
-            if k.lower() == 'x-models-etag':
-                _etag['upstream'] = v
-                v = with_tag(v)
-            if k.lower() not in HOP:
-                self.send_header(k, v)
-        if r.status in (204, 304) or self.command == 'HEAD':
-            self.end_headers()
-            return
-        self.send_header('Transfer-Encoding', 'chunked')
-        self.end_headers()
+                request_id = r.getheader('x-request-id') or r.getheader('x-oai-request-id') or '-'
+                inspect = recovery is not None and self.path.split('?')[0].endswith('/responses') and \
+                    r.status == 200 and (r.getheader('Content-Encoding') or 'identity').lower() == 'identity' and \
+                    'json' not in (r.getheader('Content-Type') or '').lower()
+                if r.status >= 400:
+                    outcome = 'http_error'
+                if recovery is not None and r.status in RETRYABLE:
+                    pending.extend(r.read(65536))
+                    try:
+                        err = error_fields(json.loads(pending))
+                    except (ValueError, AttributeError):
+                        err = {}
+                    outcome = 'http_error'
+                    if not {str(err.get('code', '')), str(err.get('type', ''))} & QUOTA_CODES:
+                        wait = delay(attempt, r.getheader('Retry-After'))
+                    if wait is not None:
+                        continue
+                if r.status in (204, 304) or self.command == 'HEAD':
+                    begin()
+                    return
+                if not inspect:
+                    begin()
+                while True:
+                    try:
+                        data = r.read1(65536)
+                    except STREAM_ERRORS:
+                        if probe.terminal:  # 已有完整终态事件，仅缺 HTTP 的结束块
+                            break
+                        raise
+                    if not data:
+                        if inspect and not probe.terminal:
+                            raise http.client.IncompleteRead(b'')
+                        break
+                    if inspect:
+                        probe.feed(data)
+                    if not committed:
+                        pending.extend(data)
+                        if probe.failure is not None and not probe.output:
+                            outcome = 'stream_error'
+                            if transient_error(probe.failure):
+                                wait = delay(attempt, r.getheader('Retry-After'))
+                            if wait is not None:
+                                break
+                        if probe.output or probe.failure is not None or len(pending) > PRELUDE_LIMIT:
+                            begin()
+                    else:
+                        self.chunk(data)
+                if wait is not None:
+                    continue
+                if not committed:
+                    begin()
+                self.end()
+                return
+            except STREAM_ERRORS as e:
+                outcome = 'disconnect'
+                # 仅从上游读数据时的错误可恢复；客户端写失败交给外层关闭连接。
+                if committed or self.response_started:
+                    self.close_connection = True
+                    return
+                wait = delay(attempt) if recovery is not None or r is None else None
+                if wait is None:
+                    return self.error(502, f'upstream disconnected ({type(e).__name__})', 'upstream_disconnect')
+            finally:
+                if probe.failure is not None:
+                    outcome = 'stream_error'
+                fields = {'http': r.status if r else None, 'outcome': outcome, 'attempt': attempt + 1,
+                          'committed': committed, 'request_id': request_id,
+                          'elapsed': round(time.monotonic() - started, 3)}
+                if probe.failure is not None:
+                    fields.update(code=probe.failure.get('code'), error_type=probe.failure.get('type'))
+                if wait is not None:
+                    fields['retry_in'] = round(wait, 3)
+                self.log(f'{label} -> openai ' + json.dumps(fields, ensure_ascii=False))
+                if r is not None:
+                    r.close()
+                if wait is not None:
+                    time.sleep(wait)
+
+    def gpt(self, prefix, body, cfg, headers=None, label='', note=None):
+        opts = {'max_concurrency': 3, 'queue_timeout': 30, **cfg.get('openai', {})}
+        gate = slot('@openai', opts)
+        t0 = time.monotonic()
+        if not gate.acquire(timeout=max(0, float(opts['queue_timeout']))):
+            self.log(f'{label} openai_queue_timeout waited={time.monotonic() - t0:.3f}s')
+            return self.send_json(503, {'error': {'code': 'witches_queue_timeout', 'type': 'witches_error',
+                                  'message': 'witches: GPT concurrency queue timed out'}}, {'Retry-After': '2'})
         try:
-            if note and r.status < 300:  # ChatGPT 后端的 SSE 不带 Content-Type，不能靠它判断
-                self.emit_note(note)  # 只在流前面多写几个事件，GPT 的响应本身一个字节不改
-            while data := r.read1(65536):
-                self.chunk(data)
-            self.end()
-        finally:  # Codex 收到 completed 就可能断开，日志照样要记
-            self.log(f'{label} -> openai {r.status}'.strip())
+            return self.passthrough(prefix, body, headers, label, note, recovery=opts)
+        finally:
+            gate.release()
 
     def models(self, prefix):
         """ChatGPT 的模型列表 + 我们的模型。上游不可用时用 Codex 自己缓存的列表兜底。"""
         own, extra = None, {}
         h = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {'accept-encoding'}}
+        r = None
         try:
             r = fetch('GET', OPENAI[prefix] + self.path[len(prefix):], None, h, timeout=4)
             b = r.read()
@@ -846,8 +1091,11 @@ class Handler(BaseHTTPRequestHandler):
                 own = json.loads(b)['models']
                 _etag['upstream'] = r.getheader('ETag') or _etag['upstream']
                 extra = {'ETag': with_tag(r.getheader('ETag'))} if r.getheader('ETag') else {}
-        except (OSError, ValueError, KeyError):
+        except (OSError, http.client.HTTPException, ValueError, KeyError):
             pass
+        finally:
+            if r is not None:
+                r.close()
         if own is None:
             try:
                 own = json.loads((CODEX_HOME / 'models_cache.json').read_text())['models']
@@ -892,8 +1140,8 @@ class Handler(BaseHTTPRequestHandler):
         if '/' not in model:  # GPT：只在线程里有 witches 痕迹时改写，否则连压缩过的原始字节一起原样转发
             if isinstance(req.get('input'), list) and (clean := for_openai(items)) != req['input']:
                 h = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {'content-encoding'}}
-                return self.passthrough(prefix, json.dumps({**req, 'input': clean}).encode(), h, model + ' (cleaned)', note)
-            return self.passthrough(prefix, raw, label=model, note=note)
+                return self.gpt(prefix, json.dumps({**req, 'input': clean}).encode(), cfg, h, model + ' (cleaned)', note)
+            return self.gpt(prefix, raw, cfg, label=model, note=note)
         if isinstance(req.get('input'), list):
             req = {**req, 'input': items}
         if not self.authorized():
@@ -916,6 +1164,7 @@ class Handler(BaseHTTPRequestHandler):
             if gate:
                 gate.acquire()
             try:
+                self.stream_outcome = 'ok'
                 if any(it.get('type') == 'compaction_trigger' for it in req.get('input') or []):
                     ok = self.compact(req, p, m, slug, last)
                 else:
@@ -925,7 +1174,7 @@ class Handler(BaseHTTPRequestHandler):
                 if gate:
                     gate.release()
             if ok:
-                self.log(f'{slug} ok {time.time() - t0:.1f}s' + (f' (fallback from {model})' if i else '')
+                self.log(f'{slug} {self.stream_outcome} {time.time() - t0:.1f}s' + (f' (fallback from {model})' if i else '')
                          + (f' [{sub}]' if sub else ''))
                 return
 
@@ -952,29 +1201,47 @@ class Handler(BaseHTTPRequestHandler):
                 r = call_upstream(p, {**to_responses(req, m), 'stream': True}, '/responses')
         except Upstream as e:
             return self.failed(slug, e, last)
-        self.begin()
-        if chat:
-            chat_stream(r, self.emit, slug, names, note)
-        else:  # Responses 上游：原样转发，只给条目 id 打标记、去掉推理里的加密内容（都是切回 GPT 时会 400 的东西）
-            self.emit_note(note)
-            for line in r:
-                if line.startswith(b'data:'):
-                    try:
-                        ev = json.loads(line[5:])
-                    except ValueError:
-                        ev = None
-                    if isinstance(ev, dict):
-                        for it in [ev.get('item')] + list((ev.get('response') or {}).get('output') or []):
-                            if isinstance(it, dict):
-                                if it.get('id'):
-                                    it['id'] = mark(it['id'])
-                                if it.get('type') == 'reasoning':
-                                    it.pop('encrypted_content', None)
-                        if ev.get('item_id'):
-                            ev['item_id'] = mark(ev['item_id'])
-                        line = b'data: ' + json.dumps(ev, ensure_ascii=False).encode() + b'\n'
-                self.chunk(line)
-        self.end()
+        def stream_error(err):
+            self.stream_outcome = 'stream_error'
+            self.log(f'{slug} ' + json.dumps({'outcome': 'stream_error', 'code': err.get('code'),
+                     'error_type': err.get('type'), 'request_id': r.getheader('x-request-id') or
+                     r.getheader('x-oai-request-id'), 'committed': True}, ensure_ascii=False))
+
+        def emit(kind, obj):
+            if kind == 'response.failed':
+                stream_error(error_fields(obj))
+            self.emit(kind, obj)
+
+        with r:
+            self.begin()
+            if chat:
+                chat_stream(r, emit, slug, names, note)
+            else:  # Responses 上游：只给条目 id 打标记、去掉加密推理
+                probe = StreamProbe()
+                self.emit_note(note)
+                for line in r:
+                    probe.feed(line)
+                    if line.startswith(b'data:'):
+                        try:
+                            ev = json.loads(line[5:])
+                        except ValueError:
+                            ev = None
+                        if isinstance(ev, dict):
+                            for it in [ev.get('item')] + list((ev.get('response') or {}).get('output') or []):
+                                if isinstance(it, dict):
+                                    if it.get('id'):
+                                        it['id'] = mark(it['id'])
+                                    if it.get('type') == 'reasoning':
+                                        it.pop('encrypted_content', None)
+                            if ev.get('item_id'):
+                                ev['item_id'] = mark(ev['item_id'])
+                            line = b'data: ' + json.dumps(ev, ensure_ascii=False).encode() + b'\n'
+                    self.chunk(line)
+                if probe.failure is not None:
+                    stream_error(probe.failure)
+                if not probe.terminal:
+                    raise http.client.IncompleteRead(b'')
+            self.end()
         return True
 
     def compact(self, req, p, m, slug, last):
@@ -1109,7 +1376,8 @@ WantedBy=default.target
 def wait_up(port):
     for _ in range(50):
         try:
-            fetch('GET', f'http://127.0.0.1:{port}/health', timeout=1).read()
+            with fetch('GET', f'http://127.0.0.1:{port}/health', timeout=1) as r:
+                r.read()
             return True
         except OSError:
             time.sleep(0.1)
@@ -1158,10 +1426,10 @@ def status():
     print('服务       :', '运行中' if wait_up(port) else '未运行', f'127.0.0.1:{port}   日志 {HOME / "witches.log"}')
     for pname, p in cfg.get('providers', {}).items():
         try:
-            r = fetch('GET', p['base_url'].rstrip('/') + '/models', None,
-                      {'Authorization': f"Bearer {p.get('api_key', '')}"}, timeout=8)
-            r.read()
-            ok = r.status
+            with fetch('GET', p['base_url'].rstrip('/') + '/models', None,
+                       {'Authorization': f"Bearer {p.get('api_key', '')}"}, timeout=8) as r:
+                r.read()
+                ok = r.status
         except OSError as e:
             ok = e
         print(f'{pname:10} :', ok, ', '.join(p.get('models', {})))

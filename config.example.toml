@@ -5,7 +5,14 @@ port = 10777
 
 # 纯文本模型收到图片时，先交给这个模型转写成文字（低推理强度；按图片哈希缓存在 ~/.witches/vision/）。
 # 可以写成列表，依次回退。不配则纯文本模型不收图。
-# vision = ["gateway/kimi-k3", "mimo/mimo-v2.6-pro"]
+# vision = ["gateway/kimi-k3", "gateway/glm-5.3-flash", "mimo/mimo-v2.6-pro"]
+
+# GPT 通道独立于 providers 的并发/重试设置。每台 witches 进程单独计数。
+[openai]
+max_concurrency = 3       # 0 表示不限制；改完对新请求生效
+queue_timeout = 30        # 秒；超时返回 witches_queue_timeout + Retry-After
+max_retries = 2           # 首次输出事件前最多额外重试 2 次；0 可关闭
+retry_window = 60         # 秒；仅在此窗口内安排重试，不是单次模型生成的超时
 
 # 子代理/审查改用第三方模型。key 是 Codex 请求头 x-openai-subagent 的值：
 #   collab_spawn = spawn_agent 子代理   guardian = 自动审批审查   review = /review   memory_consolidation = 记忆整理
@@ -32,6 +39,8 @@ max_concurrency = 6       # 可选：同时打到这个上游的请求数，多�
 #   wire 覆盖 provider 的 wire | upstream 上游真实模型名 | extra 合并进请求体的字段
 #   fallback 429/5xx/连不上时依次改用的模型 | hidden = true 不在 Codex 选择器里显示（只给 vision/fallback 用）
 "glm-5.3" = { context = 200000, fallback = ["mimo/mimo-v2.6-pro"] }
+# 仅在你的上游已验证支持直接收图时配置 images = true；不同网关的同名模型能力可能不同。
+"glm-5.3-flash" = { context = 128000, images = true }
 "kimi-k3" = { context = 262144, images = true }
 "gpt-6.1-sol" = { context = 272000, images = true, wire = "responses" }
 

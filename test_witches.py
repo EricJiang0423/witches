@@ -49,7 +49,7 @@ class Fake(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers['Content-Length']))
         seen.append((self.path, dict(self.headers), body))
         if self.path.startswith('/r/'):  # 原生 Responses 上游
-            return self.reply(200, b'data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"X"}}\n\n', 'text/event-stream')
+            return self.reply(200, b'data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"X"}}\n\ndata: {"type":"response.completed"}\n\n', 'text/event-stream')
         if self.path.startswith('/busy'):
             return self.reply(429, {'error': {'message': 'slow down'}})
         if self.path.endswith('/chat/completions'):
@@ -104,7 +104,8 @@ def post(body, headers=None, raw=None):
         r = urllib.request.urlopen(req)
         return r.status, r.read().decode()
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode()
+        with e:
+            return e.code, e.read().decode()
 
 
 def events(sse):
