@@ -128,6 +128,8 @@ gpt-6.1-sol -> openai {"http": 200, "outcome": "stream_error", "attempt": 1, "co
 
 `max_concurrency = 0` 关闭并发限制，`max_retries = 0` 关闭 GPT 内部重试。并发设置可热更新；`retry_window` 限制安排重试的时间，不限制一次已开始的模型生成。多台机器或多个 witches 进程共用账号时，需要自行协调总并发。
 
+本机 `GET /health` 返回进程 PID、GPT 配置及 `active` / `waiting` / `runtime_limit`，可用于重启后核验运行进程、并发和排队。配置值来自当前文件，`runtime_limit` 是上一次 GPT 请求应用的上限；仅检查健康不会修改闸门或触发模型请求。
+
 ## 已知限制
 
 - **witches 停了，GPT 也用不了**：这是 Codex 的限制。provider 按线程绑定、模型没有自己的 base URL，所以"同一线程能切第三方模型"和"GPT 完全不经过代理"只能二选一。witches 选了前者，由 systemd/launchd 守护（`Restart=always` / `KeepAlive`）。

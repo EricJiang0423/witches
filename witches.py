@@ -51,6 +51,7 @@ QUOTA_CODES = {'insufficient_quota', 'quota_exhausted', 'billing_hard_limit_reac
                'project_spend_limit_exceeded', 'organization_usage_limit_exceeded'}
 STREAM_ERRORS = (OSError, http.client.HTTPException)
 PRELUDE_LIMIT = 262144
+OPENAI_DEFAULTS = {'max_concurrency': 3, 'queue_timeout': 30, 'max_retries': 2, 'retry_window': 60}
 PROMPT = Path(__file__).resolve().with_name('prompt.md').read_text()  # Codex 的基础提示词（openai/codex，Apache-2.0）
 
 # Codex 自己的压缩提示词与摘要前缀（openai/codex，Apache-2.0）
@@ -248,7 +249,7 @@ class Gate:
     """可热更新的进程内并发闸门；缩小上限不影响已在运行的请求。"""
     def __init__(self):
         self.condition = threading.Condition()
-        self.active, self.limit = 0, 0
+        self.active, self.limit, self.waiting = 0, 0, 0
 
     def resize(self, limit):
         with self.condition:
@@ -257,15 +258,23 @@ class Gate:
 
     def acquire(self, timeout=None):
         with self.condition:
-            if not self.condition.wait_for(lambda: not self.limit or self.active < self.limit, timeout):
-                return False
-            self.active += 1
-            return True
+            self.waiting += 1
+            try:
+                if not self.condition.wait_for(lambda: not self.limit or self.active < self.limit, timeout):
+                    return False
+                self.active += 1
+                return True
+            finally:
+                self.waiting -= 1
 
     def release(self):
         with self.condition:
             self.active -= 1
             self.condition.notify_all()
+
+    def snapshot(self):
+        with self.condition:
+            return {'active': self.active, 'waiting': self.waiting, 'runtime_limit': self.limit}
 
 
 def slot(pname, p):
@@ -274,6 +283,18 @@ def slot(pname, p):
         gate = _slots.setdefault(pname, Gate())
         gate.resize(p.get('max_concurrency', 0))
         return gate
+
+
+def openai_options(cfg):
+    return {**OPENAI_DEFAULTS, **cfg.get('openai', {})}
+
+
+def health():
+    opts = openai_options(config())
+    with _slots_lock:
+        gate = _slots.get('@openai')
+    state = gate.snapshot() if gate else {'active': 0, 'waiting': 0, 'runtime_limit': opts['max_concurrency']}
+    return {'ok': True, 'pid': os.getpid(), 'openai': {**{k: opts[k] for k in OPENAI_DEFAULTS}, **state}}
 
 
 def retry_after(value):
@@ -918,7 +939,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(n) if n else b''  # 先读完请求体，keep-alive 连接上的下一个请求才不会错位
         prefix = next((p for p in OPENAI if self.path.startswith(p + '/') or self.path == p), None)
         if self.path == '/health':
-            return self.send_json(200, {'ok': True})
+            return self.send_json(200, health())
         if self.headers.get('Upgrade', '').lower() == 'websocket':  # 426 让 Codex 立刻退回 HTTP
             return self.send_json(426, {'error': {'message': 'witches: HTTP only', 'type': 'witches_error'}})
         if prefix is None:
@@ -1065,7 +1086,7 @@ class Handler(BaseHTTPRequestHandler):
                     time.sleep(wait)
 
     def gpt(self, prefix, body, cfg, headers=None, label='', note=None):
-        opts = {'max_concurrency': 3, 'queue_timeout': 30, **cfg.get('openai', {})}
+        opts = openai_options(cfg)
         gate = slot('@openai', opts)
         t0 = time.monotonic()
         if not gate.acquire(timeout=max(0, float(opts['queue_timeout']))):

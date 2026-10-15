@@ -147,6 +147,14 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         finally:
             conn.close()
 
+    def health(self):
+        conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=5)
+        try:
+            conn.request('GET', '/health')
+            return json.loads(conn.getresponse().read())
+        finally:
+            conn.close()
+
     def test_capacity_before_output_retries_and_keeps_wire_bytes(self):
         self.up.scripts['gpt-x'] = [{'body': CREATED + BUSY}, {'body': CREATED + DONE}]
         raw = zstd.compress(json.dumps({'model': 'gpt-x', 'stream': True, 'input': []}).encode())
@@ -290,10 +298,16 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
             try:
                 self.assertEqual(self.up.counts.get('gpt-x'), 3)
                 self.assertEqual(witches._slots['@openai'].active, 3)
+                deadline = time.monotonic() + 2
+                while self.health()['openai']['waiting'] < 3 and time.monotonic() < deadline:
+                    time.sleep(.01)
+                state = self.health()['openai']
+                self.assertEqual((state['active'], state['waiting'], state['runtime_limit']), (3, 3, 3))
             finally:
                 self.up.block.set()
             self.assertTrue(all(job.result()[0] == 200 for job in jobs))
         self.assertEqual(witches._slots['@openai'].active, 0)
+        self.assertEqual(self.health()['openai']['waiting'], 0)
         self.up.scripts['gpt-x'] = [{'body': CREATED + OUTPUT, 'drop': True}]
         self.post()
         self.assertEqual(witches._slots['@openai'].active, 0)
@@ -344,6 +358,14 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         future = format_datetime(datetime.datetime.fromtimestamp(time.time() + 60, datetime.timezone.utc), usegmt=True)
         self.assertGreater(witches.retry_after(future), 58)
         self.assertIsNone(witches.retry_after('invalid'))
+
+    def test_health_reports_only_allowlisted_settings(self):
+        self.cfg('unrelated_private_setting = "PRIVATE_MESSAGE"\n')
+        result = self.health()
+        self.assertEqual(result['pid'], os.getpid())
+        self.assertEqual(result['openai']['max_retries'], 2)
+        self.assertEqual(result['openai']['retry_window'], 60)
+        self.assertNotIn('PRIVATE_MESSAGE', json.dumps(result))
 
 
 if __name__ == '__main__':
