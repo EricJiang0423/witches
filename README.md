@@ -13,7 +13,7 @@ Codex ──openai_base_url──▶ witches (127.0.0.1:10777) ──┬─▶ c
 [opencodex](https://github.com/lidge-jun/opencodex) 和 [magpie](https://github.com/yetone/magpie) 功能很全，但在 Codex remote（远程服务器开发）的场景里太重：每台机器都要装一整套，还要处理环境变量、令牌、shim、状态文件。witches 只做一件事，尽量不碰 Codex：
 
 - **对 Codex 只改一行**：`config.toml` 顶部加一行 `openai_base_url`，不加 provider、不加模型目录、不改 features。Codex 继续用内置的 `openai` provider，所以**登录态不动、旧线程照常显示和继续**。
-- **GPT 原样转发**：请求体字节级透传（连 zstd 压缩一起），请求头/响应头原样往返（包括 `x-codex-turn-state` 粘性路由）。不存状态、不 replay，witches 自己从不生成 429。
+- **GPT 透传与恢复**：请求体字节级透传（连 zstd 压缩一起），保留 `x-codex-turn-state` 粘性路由及上游响应头。为检查流内错误，GPT 请求使用 `Accept-Encoding: identity`；响应体保留原始字节。仅在输出事件交给 Codex 前有限重试，不存会话状态，witches 自己从不生成 429。
 - **同一线程里随便切模型**：GPT → glm → GPT 都能接着聊。切回 GPT 时，witches 会把第三方留下的推理条目、陌生 id、压缩摘要清理成 OpenAI 认的样子。
 - **单文件**：`witches.py` + `prompt.md`，只需要 [uv](https://docs.astral.sh/uv/)（会自动装 Python 3.14）。每台机器各跑各的，互不影响。
 
@@ -63,7 +63,13 @@ mkdir -p ~/.witches && cp config.example.toml ~/.witches/config.toml   # 填上�
 
 ```toml
 port = 10777
-vision = ["gateway/kimi-k3", "mimo/mimo-v2.6-pro"]   # 可选：纯文本模型的"眼睛"，依次回退
+vision = ["gateway/kimi-k3", "gateway/glm-5.3-flash", "mimo/mimo-v2.6-pro"] # 依次回退，先验证上游收图能力
+
+[openai]                            # GPT 通道独立并发限制；不与第三方 provider 共用
+max_concurrency = 3
+queue_timeout = 30
+max_retries = 2
+retry_window = 60
 
 [route]                              # 可选：子代理/审查改用第三方模型
 collab_spawn = "gateway/glm-5.3"
@@ -76,6 +82,7 @@ max_concurrency = 6
 
 [providers.gateway.models]
 "glm-5.3" = { context = 200000, fallback = ["mimo/mimo-v2.6-pro"] }
+"glm-5.3-flash" = { context = 128000, images = true } # 仅用于已验证收图的上游
 "kimi-k3" = { context = 262144, images = true }
 ```
 
@@ -93,6 +100,7 @@ max_concurrency = 6
 | 子代理/审查改派 | `[route]` 按 Codex 的 `x-openai-subagent` 请求头（`collab_spawn` / `guardian` / `review` / `memory_consolidation`）把原本发给 GPT 的请求改派给第三方模型，不用改 Codex 配置 |
 | 看图代理 | 配了 `vision` 后，纯文本模型也会声明能收图；图片（用户贴的截图、`view_image`、浏览器/computer-use 截图）先交给 vision 模型用低推理强度转写成文字（`vision` 可写成列表依次回退），结果按图片哈希缓存在 `~/.witches/vision/`，同一张图只看一次，重启也不用重看。实测一张 1570×1312 的高密度中文截图：kimi-k3 约 33 秒转写完，第二次 1.7 秒 |
 | 429 规避 | `fallback` 遇到 429/5xx/连不上就在首字节前换下一个模型；整条链最多走 3 轮，按 `Retry-After` 或指数退避；`max_concurrency` 让突发请求排队 |
+| GPT 恢复 | `[openai]` 默认同时运行 3 个请求，排队最多 30 秒。HTTP 临时错误、流内明确的容量/限流错误、输出前断流最多额外重试 2 次；在 60 秒窗口内安排带随机退避的重试，支持秒数与 HTTP 日期格式的 `Retry-After`。等待要求超出窗口就把最后的错误交给 Codex，不缩短等待时间 |
 | 代理 | 遵循 `http(s)_proxy`/`no_proxy`；私网 IP（含 Tailscale `100.64.0.0/10`）总是直连 |
 | 安全 | 只有带着本机 Codex 登录令牌（`auth.json`）的请求才能用第三方模型；只监听 127.0.0.1 |
 
@@ -108,7 +116,19 @@ witches deploy <ssh-host>      同步到远端并安装
 
 排查问题时可以设置 `WITCHES_DUMP=<目录>` 再前台运行 `witches serve`，每个请求体都会存一份到这个目录（里面是完整对话内容，用完记得删）。
 
-日志在 `~/.witches/witches.log`，每个请求一行：`gpt-6.1-sol -> openai 200`、`gateway/glm-5.3 ok 6.2s`、`vision mimo/mimo-v2.6-pro 6.7s ok`。
+日志在 `~/.witches/witches.log`。GPT 每次尝试记录 HTTP 状态、流结果、错误码、request ID、耗时、是否已经交付事件及下次重试延迟，例如：
+
+```text
+gpt-6.1-sol -> openai {"http": 200, "outcome": "stream_error", "attempt": 1, "committed": false, "request_id": "...", "elapsed": 1.2, "code": "server_overloaded", "retry_in": 1.5}
+```
+
+流诊断不记录对话、错误 message、凭据或 Cookie。第三方模型仍有 `gateway/glm-5.3 ok 6.2s` 和看图转写日志，流内失败单独记为 `stream_error`。排队超时使用独立的 `witches_queue_timeout`，与上游满载区分。
+
+只缓冲 `response.created` / `in_progress` / `queued` 和心跳等启动事件，缓冲上限 256 KiB；任何输出条目（包括推理、工具）、未知事件或超出缓冲上限都会提交响应，此后代理不再重放。授权、配额耗尽和无效请求错误不因流内重试而掩盖。完整终态前断流时关闭客户端连接，不伪造成功结束，让 Codex 识别截断；已经收到完整终态时，即使上游缺 HTTP 结束块，也不重放。
+
+`max_concurrency = 0` 关闭并发限制，`max_retries = 0` 关闭 GPT 内部重试。并发设置可热更新；`retry_window` 限制安排重试的时间，不限制一次已开始的模型生成。多台机器或多个 witches 进程共用账号时，需要自行协调总并发。
+
+本机 `GET /health` 返回进程 PID、GPT 配置及 `active` / `waiting` / `runtime_limit`，可用于重启后核验运行进程、并发和排队。配置值来自当前文件，`runtime_limit` 是上一次 GPT 请求应用的上限；仅检查健康不会修改闸门或触发模型请求。
 
 ## 已知限制
 
@@ -122,6 +142,7 @@ witches deploy <ssh-host>      同步到远端并安装
 
 ```bash
 ./test_witches.py      # 端到端自检：假 ChatGPT 后端 + 假上游，覆盖透传、翻译、压缩、fallback、改派、看图
+uv run --script test_recovery.py  # 容量错误、首输出边界、断流、Retry-After、并发与排队超时
 ```
 
 ## 致谢
