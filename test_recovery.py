@@ -155,6 +155,16 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         finally:
             conn.close()
 
+    def wait_idle(self):
+        gate = witches._slots.get('@openai')
+        if gate:
+            with gate.condition:
+                self.assertTrue(gate.condition.wait_for(lambda: gate.active == 0, timeout=2))
+
+    def attempt_logs(self):
+        self.wait_idle()
+        return [json.loads(row.split(' -> openai ', 1)[1]) for row in self.proxy.logs if ' -> openai {' in row]
+
     def test_capacity_before_output_retries_and_keeps_wire_bytes(self):
         self.up.scripts['gpt-x'] = [{'body': CREATED + BUSY}, {'body': CREATED + DONE}]
         raw = zstd.compress(json.dumps({'model': 'gpt-x', 'stream': True, 'input': []}).encode())
@@ -366,6 +376,65 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.assertEqual(result['openai']['max_retries'], 2)
         self.assertEqual(result['openai']['retry_window'], 60)
         self.assertNotIn('PRIVATE_MESSAGE', json.dumps(result))
+
+    def test_retry_chain_is_correlated_and_client_disconnect_is_not_replayed(self):
+        self.up.scripts['gpt-x'] = [{'body': CREATED + BUSY}, {}]
+        self.post()
+        rows = self.attempt_logs()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]['chain_id'], rows[1]['chain_id'])
+        self.assertNotEqual(rows[0]['request_id'], rows[1]['request_id'])
+        self.up.counts.clear()
+        self.proxy.logs.clear()
+        self.up.scripts['gpt-x'] = [{}]
+        with patch('witches.Handler.chunk', side_effect=BrokenPipeError):
+            self.assertTrue(self.post()[3])
+        rows = self.attempt_logs()
+        self.assertEqual(self.up.counts['gpt-x'], 1)
+        self.assertEqual(rows[0]['outcome'], 'client_disconnect')
+        self.assertEqual(rows[0]['stage'], 'write_stream')
+        self.assertEqual(rows[0]['error_class'], 'BrokenPipeError')
+
+    def test_header_write_failure_is_never_replayed(self):
+        with patch('witches.Handler.end_headers', side_effect=BrokenPipeError):
+            with self.assertRaises(http.client.RemoteDisconnected):
+                self.post()
+        row = self.attempt_logs()[0]
+        self.assertEqual(self.up.counts['gpt-x'], 1)
+        self.assertEqual((row['outcome'], row['stage']), ('client_disconnect', 'write_headers'))
+
+    def test_upstream_disconnect_reports_read_stage_and_missing_terminal(self):
+        self.up.scripts['gpt-x'] = [{'body': CREATED + OUTPUT, 'drop': True}]
+        self.post()
+        row = self.attempt_logs()[0]
+        self.assertEqual((row['outcome'], row['stage'], row['terminal']), ('disconnect', 'read_stream', None))
+        self.assertEqual(row['error_class'], 'IncompleteRead')
+        self.assertGreater(row['delivered_bytes'], 0)
+
+    def test_incomplete_is_distinguished_from_success(self):
+        body = event('response.incomplete', response={'incomplete_details': {'reason': 'max_output_tokens'}})
+        self.up.scripts['gpt-x'] = [{'body': body}]
+        self.assertEqual(self.post()[1], body)
+        row = self.attempt_logs()[0]
+        self.assertEqual((row['outcome'], row['terminal']), ('incomplete', 'response.incomplete'))
+
+    def test_invalid_encrypted_content_logs_shape_and_preserves_capsules(self):
+        req = {'model': 'gpt-x', 'input': [
+            {'type': 'reasoning', 'encrypted_content': 'PRIVATE_REASONING'},
+            {'type': 'message', 'role': 'developer', 'content': [
+                {'type': 'encrypted_content', 'encrypted_content': 'PRIVATE_CAPSULE'}]}]}
+        raw = zstd.compress(json.dumps(req).encode())
+        body = event('response.failed', response={'error': {'code': 'invalid_encrypted_content',
+                     'param': 'input[1].content[0].encrypted_content', 'message': 'PRIVATE_MESSAGE'}})
+        self.up.scripts['gpt-x'] = [{'body': body}]
+        self.assertEqual(self.post(raw=raw, headers={'Content-Encoding': 'zstd'})[1], body)
+        row = self.attempt_logs()[0]
+        self.assertEqual(self.up.seen[0][1], raw)
+        self.assertEqual(self.up.counts['gpt-x'], 1)
+        self.assertEqual(row['encryption_shape']['content_capsules'], 1)
+        self.assertEqual(row['encryption_shape']['reasoning'], 1)
+        self.assertEqual(row['error_param'], 'input[1].content[0].encrypted_content')
+        self.assertNotIn('PRIVATE_', json.dumps(row))
 
 
 if __name__ == '__main__':
