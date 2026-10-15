@@ -11,6 +11,7 @@ import json
 import os
 import select
 import socket
+import socketserver
 import tempfile
 import threading
 import time
@@ -508,6 +509,58 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
             self.assert_cancel_release(cancelled['chain_id'])
         finally:
             conn.close()
+
+    def test_cancel_during_tls_handshake_releases_slot(self):
+        for via_proxy in (False, True):
+            with self.subTest(via_proxy=via_proxy):
+                self.proxy.logs.clear()
+                started, closed = threading.Event(), threading.Event()
+
+                class StalledTLS(socketserver.BaseRequestHandler):
+                    def handle(inner):
+                        inner.request.settimeout(2)
+                        try:
+                            if via_proxy:
+                                headers = bytearray()
+                                while not headers.endswith(b'\r\n\r\n'):
+                                    data = inner.request.recv(1)
+                                    if not data:
+                                        return
+                                    headers.extend(data)
+                                inner.request.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
+                            if inner.request.recv(65536):  # 收到 ClientHello，但不回复 TLS 握手
+                                started.set()
+                            while inner.request.recv(65536):
+                                pass
+                            closed.set()
+                        except ConnectionResetError:
+                            closed.set()
+                        except TimeoutError:
+                            pass
+
+                server = Server(('127.0.0.1', 0), StalledTLS)
+                server.errors = []
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+                url = 'https://upstream.invalid' if via_proxy else f'https://127.0.0.1:{server.server_port}'
+                env = {'https_proxy': f'http://127.0.0.1:{server.server_port}', 'no_proxy': ''} if via_proxy else {}
+                try:
+                    with patch.dict(witches.OPENAI, {'/backend-api/codex': url}), patch.dict(os.environ, env):
+                        conn = self.open_request()
+                        try:
+                            self.assertTrue(started.wait(1))
+                            conn.close()
+                            self.assertTrue(closed.wait(.8), 'TLS handshake must abort without waiting for peer timeout')
+                            row = self.attempt_logs()[0]
+                            self.assertEqual(row['retry_stop'], 'client_cancelled')
+                            self.assertEqual(row['connect_phase'], 'tls_handshake')
+                            self.assertEqual(row['connection_route'], 'proxy' if via_proxy else 'direct')
+                            self.assert_cancel_release(row['chain_id'])
+                        finally:
+                            conn.close()
+                            self.wait_idle()
+                finally:
+                    server.shutdown()
+                    server.server_close()
 
     def test_cancel_during_buffered_stream_closes_upstream(self):
         for headers in ({}, {'Connection': 'close'}):

@@ -226,6 +226,7 @@ class ClientWatch:
         self.client, self.upstream, self.upstream_socket = client, None, None
         self.cancelled, self.done = threading.Event(), threading.Event()
         self.cancelled_at, self.chain_id = None, None
+        self.connect_phase, self.connection_route = None, None
         self.handled = False  # 请求线程确实因取消而终止；完整响应后的 EOF 不算取消
         self.lock = threading.Lock()
         self.poller = select.poll()  # 不受 select() 的 FD_SETSIZE 限制
@@ -312,10 +313,25 @@ def fetch(method, url, body=None, headers=None, timeout=900, cancel=None):
         conn = http.client.HTTPConnection(u.hostname, port, timeout=timeout)
     try:
         if cancel is not None:
+            cancel.connection_route = 'proxy' if proxy else 'direct'
+            cancel.connect_phase = 'tcp_or_proxy_connect'
             cancel.bind(conn)
-            conn.connect()
-            cancel.bind(conn)  # getresponse() 可能把 Connection: close 的 socket 从 conn 分离
+            # HTTPSConnection.connect() 在 wrap_socket 返回前不会发布 SSLSocket；
+            # 默认的阻塞握手会让监视器只能拿到已被 detach 的旧 socket。
+            http.client.HTTPConnection.connect(conn)
+            cancel.bind(conn)
+            if https:
+                cancel.connect_phase = 'tls_handshake'
+                conn.sock = _ctx.wrap_socket(conn.sock, server_hostname=u.hostname,
+                                             do_handshake_on_connect=False)
+                cancel.bind(conn)  # 先发布可 shutdown 的 SSLSocket，再进入阻塞握手
+                conn.sock.do_handshake()
+                cancel.check()
+            cancel.connect_phase = 'send_request'
         conn.request(method, path, body=body, headers=headers or {})
+        if cancel is not None:
+            cancel.connect_phase = 'response_headers'
+            cancel.bind(conn)  # getresponse() 可能把 Connection: close 的 socket 从 conn 分离
         return Response(conn.getresponse(), conn)
     except BaseException:
         conn.close()
@@ -1260,6 +1276,10 @@ class Handler(BaseHTTPRequestHandler):
                     retry_stop = 'output_started'
                 if retry_stop is not None:
                     fields['retry_stop'] = retry_stop
+                if cancel is not None:
+                    fields['connection_route'] = cancel.connection_route
+                    if stage == 'connect':
+                        fields['connect_phase'] = cancel.connect_phase
                 if truncated_after_terminal:
                     fields['truncated_after_terminal'] = True
                 if probe.failure is not None:
