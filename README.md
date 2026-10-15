@@ -135,6 +135,8 @@ GPT 日志中的 `chain_id` 关联同一请求的全部尝试，`request_id` 是
 
 GPT 请求会在排队、连接/读取上游及重试退避期间监视客户端连接。Codex 取消任务并断开连接后，witches 停止后续重试、shutdown 已建立的上游 socket，及时释放并发名额；不再等模型输出后才通过 BrokenPipe 发现取消。监视器不读取后续请求内容，不提前发送 HTTP 头或改写 SSE，也不限制仍在线客户端的正常生成时长。尚未建立 socket 的 DNS/连接阶段仍受系统连接超时约束，返回后会再次检查取消。
 
+TLS socket 在握手开始前即交给取消监视器，因此直连和 CONNECT 代理的 TLS 握手停顿都可被取消打断，仍保留证书校验和原来的目标 SNI。GPT 尝试日志增加 `connection_route=direct/proxy`；在 `stage=connect` 时增加 `connect_phase`，区分 `tcp_or_proxy_connect`、`tls_handshake`、`send_request`、`response_headers`。字段不包含代理地址、凭据或请求内容。未收到上游 HTTP 响应时的 TLS/连接异常在重试耗尽后由 witches 返回 502；这类故障与上游明确返回的 capacity/429 不同，应先排查出网代理及 TLS 链路。
+
 尝试日志的 `retry_stop` 区分 `client_cancelled`（因下游 EOF/RST 终止请求）、`client_write_failed`（写回失败）、`retry_limit`、`retry_window` 和 `output_started`。完整响应交付后的正常关闭不会被标成取消，也不会覆盖已有的重试停止原因。排队/退避期间取消单独记录 `-> openai_cancel`，`stage` 为 `queue` / `retry_wait`；退避取消携带相同的 `chain_id`，不会被计作一次新的上游尝试。客户端主动取消不代表容量重试已耗尽，也不能据 BrokenPipe 的时间推断客户端的实际超时时间。
 
 因检测到客户端取消而终止的在途请求，在实际释放并发名额后单独记录 `-> openai_release`：包含相同的 `chain_id`、`reason=client_cancelled`、`cancel_to_release_ms` 和释放后的 `active` / `waiting` / `runtime_limit` 快照。耗时从代理检测到 EOF/RST 开始计算，不包含监视器检测前的时间（轮询间隔约 100 ms）。排队取消尚未占用名额，不记录释放事件；完整响应后的关闭也不记录。快照可能已经包含刚被唤醒的新请求，因此判断某条请求是否释放应按 `chain_id` 关联，不能要求总 `active` 一定下降。
