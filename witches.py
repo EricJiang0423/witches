@@ -327,6 +327,7 @@ class StreamProbe:
         self.buffer = b''
         self.output = self.terminal = self.opaque = False
         self.failure = None
+        self.terminal_kind = None
 
     def feed(self, data):
         self.buffer += data
@@ -352,14 +353,53 @@ class StreamProbe:
             if kind in ('response.failed', 'error') or event.get('error'):
                 self.failure = error_fields(event)
                 self.terminal = True
+                self.terminal_kind = kind or 'error'
             elif kind in ('response.completed', 'response.incomplete'):
                 self.terminal = self.output = True
+                self.terminal_kind = kind
             elif kind not in ('response.created', 'response.in_progress', 'response.queued', 'ping') or \
                     (isinstance(event.get('response'), dict) and event['response'].get('output')):
                 self.output = True
         if len(self.buffer) > PRELUDE_LIMIT:
             self.opaque = self.output = True
             self.buffer = b''
+
+
+def encryption_shape(body, headers):
+    """仅统计结构，不记录密文、明文、消息长度或内容。用于定位无效加密字段。"""
+    try:
+        encoding = next((v for k, v in headers.items() if k.lower() == 'content-encoding'), '')
+        req = json.loads(zstd.decompress(body) if encoding == 'zstd' else body)
+        items = req.get('input')
+        if not isinstance(items, list):
+            return {}
+        counts = {'reasoning': 0, 'compaction': 0, 'witches_compaction': 0, 'content_capsules': 0}
+
+        def visit(value):
+            if isinstance(value, dict):
+                if value.get('type') == 'encrypted_content':
+                    counts['content_capsules'] += 1
+                for child in value.values():
+                    if isinstance(child, (list, dict)):
+                        visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        for it in items:
+            if isinstance(it, dict):
+                kind = it.get('type')
+                if it.get('encrypted_content'):
+                    if kind == 'reasoning':
+                        counts['reasoning'] += 1
+                    elif kind in ('compaction', 'compaction_summary', 'context_compaction'):
+                        counts['compaction'] += 1
+                        if str(it['encrypted_content']).startswith(CMP):
+                            counts['witches_compaction'] += 1
+                visit(it)
+        return counts
+    except (ValueError, TypeError, AttributeError, zstd.ZstdError):
+        return {'unavailable': True}
 
 
 # ---------------------------------------------------------------- 请求整理
@@ -969,6 +1009,7 @@ class Handler(BaseHTTPRequestHandler):
             h['Accept-Encoding'] = 'identity'
         url = OPENAI[prefix] + self.path[len(prefix):]
         started = time.monotonic()
+        chain_id = uuid.uuid4().hex[:16]
         retries = max(0, int((recovery or {}).get('max_retries', 2)))
         window = max(0, float((recovery or {}).get('retry_window', 60)))
 
@@ -984,9 +1025,12 @@ class Handler(BaseHTTPRequestHandler):
             r, pending, committed, wait = None, bytearray(), False, None
             probe, outcome = StreamProbe(), 'ok'
             request_id = '-'
+            stage, error_class, delivered = 'connect', None, 0
+            truncated_after_terminal = False
 
             def begin():
-                nonlocal committed
+                nonlocal committed, stage, delivered
+                stage = 'write_headers'
                 self.send_response(r.status, r.reason)
                 for k, v in r.getheaders():
                     if k.lower() == 'x-models-etag':
@@ -1000,9 +1044,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 committed = True
                 if note and r.status < 300 and not no_body:
+                    stage = 'write_stream'
                     self.emit_note(note)
                 if pending:
+                    stage = 'write_stream'
                     self.chunk(bytes(pending))
+                    delivered += len(pending)
                     pending.clear()
 
             try:
@@ -1014,6 +1061,7 @@ class Handler(BaseHTTPRequestHandler):
                 if r.status >= 400:
                     outcome = 'http_error'
                 if recovery is not None and r.status in RETRYABLE:
+                    stage = 'read_http_error'
                     pending.extend(r.read(65536))
                     try:
                         err = error_fields(json.loads(pending))
@@ -1030,10 +1078,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not inspect:
                     begin()
                 while True:
+                    stage = 'read_stream'
                     try:
                         data = r.read1(65536)
                     except STREAM_ERRORS:
                         if probe.terminal:  # 已有完整终态事件，仅缺 HTTP 的结束块
+                            truncated_after_terminal = True
                             break
                         raise
                     if not data:
@@ -1053,30 +1103,46 @@ class Handler(BaseHTTPRequestHandler):
                         if probe.output or probe.failure is not None or len(pending) > PRELUDE_LIMIT:
                             begin()
                     else:
+                        stage = 'write_stream'
                         self.chunk(data)
+                        delivered += len(data)
                 if wait is not None:
                     continue
                 if not committed:
                     begin()
+                stage = 'write_end'
                 self.end()
                 return
             except STREAM_ERRORS as e:
-                outcome = 'disconnect'
-                # 仅从上游读数据时的错误可恢复；客户端写失败交给外层关闭连接。
-                if committed or self.response_started:
+                error_class = type(e).__name__
+                outcome = 'client_disconnect' if stage.startswith('write_') else 'disconnect'
+                # 客户端取消不重放；上游断流只允许在首次交付前恢复。
+                if stage.startswith('write_') or committed or self.response_started:
                     self.close_connection = True
                     return
                 wait = delay(attempt) if recovery is not None or r is None else None
                 if wait is None:
                     return self.error(502, f'upstream disconnected ({type(e).__name__})', 'upstream_disconnect')
             finally:
-                if probe.failure is not None:
+                if probe.failure is not None and outcome not in ('disconnect', 'client_disconnect'):
                     outcome = 'stream_error'
+                elif probe.terminal_kind == 'response.incomplete' and outcome == 'ok':
+                    outcome = 'incomplete'
                 fields = {'http': r.status if r else None, 'outcome': outcome, 'attempt': attempt + 1,
                           'committed': committed, 'request_id': request_id,
+                          'chain_id': chain_id, 'stage': stage, 'error_class': error_class,
+                          'terminal': probe.terminal_kind, 'delivered_bytes': delivered,
                           'elapsed': round(time.monotonic() - started, 3)}
+                if truncated_after_terminal:
+                    fields['truncated_after_terminal'] = True
                 if probe.failure is not None:
                     fields.update(code=probe.failure.get('code'), error_type=probe.failure.get('type'))
+                    if probe.failure.get('code') == 'invalid_encrypted_content':
+                        fields['encryption_shape'] = encryption_shape(body, h)
+                        param = probe.failure.get('param')
+                        if isinstance(param, str) and param.startswith('input') and \
+                                re.fullmatch(r'[A-Za-z0-9_.\[\]-]{1,160}', param):
+                            fields['error_param'] = param
                 if wait is not None:
                     fields['retry_in'] = round(wait, 3)
                 self.log(f'{label} -> openai ' + json.dumps(fields, ensure_ascii=False))

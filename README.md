@@ -124,6 +124,8 @@ gpt-6.1-sol -> openai {"http": 200, "outcome": "stream_error", "attempt": 1, "co
 
 流诊断不记录对话、错误 message、凭据或 Cookie。第三方模型仍有 `gateway/glm-5.3 ok 6.2s` 和看图转写日志，流内失败单独记为 `stream_error`。排队超时使用独立的 `witches_queue_timeout`，与上游满载区分。
 
+GPT 日志中的 `chain_id` 关联同一请求的全部尝试，`request_id` 是每次尝试的上游 ID。`stage`、`error_class`、`terminal` 和 `delivered_bytes` 用于区分上游连接/读取异常与客户端写入失败（`client_disconnect`）；客户端取消不重放。`response.incomplete` 单独记为 `incomplete`，不会记成成功。`invalid_encrypted_content` 额外记录加密字段的结构计数及合法的 `input` 字段路径，不记录或删除加密内容，不修改审批策略。
+
 只缓冲 `response.created` / `in_progress` / `queued` 和心跳等启动事件，缓冲上限 256 KiB；任何输出条目（包括推理、工具）、未知事件或超出缓冲上限都会提交响应，此后代理不再重放。授权、配额耗尽和无效请求错误不因流内重试而掩盖。完整终态前断流时关闭客户端连接，不伪造成功结束，让 Codex 识别截断；已经收到完整终态时，即使上游缺 HTTP 结束块，也不重放。
 
 `max_concurrency = 0` 关闭并发限制，`max_retries = 0` 关闭 GPT 内部重试。并发设置可热更新；`retry_window` 限制安排重试的时间，不限制一次已开始的模型生成。多台机器或多个 witches 进程共用账号时，需要自行协调总并发。
