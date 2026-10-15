@@ -225,6 +225,8 @@ class ClientWatch:
     def __init__(self, client):
         self.client, self.upstream, self.upstream_socket = client, None, None
         self.cancelled, self.done = threading.Event(), threading.Event()
+        self.cancelled_at, self.chain_id = None, None
+        self.handled = False  # 请求线程确实因取消而终止；完整响应后的 EOF 不算取消
         self.lock = threading.Lock()
         self.poller = select.poll()  # 不受 select() 的 FD_SETSIZE 限制
         self.poller.register(client, select.POLLIN)
@@ -241,12 +243,16 @@ class ClientWatch:
     def check(self):
         with self.lock:
             if not self.cancelled.is_set():
+                disconnected = False
                 try:
                     if self.poller.poll(0) and not self.client.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
-                        self.cancelled.set()
+                        disconnected = True
                 except BlockingIOError:
                     pass
                 except OSError:
+                    disconnected = True
+                if disconnected:
+                    self.cancelled_at = time.monotonic()
                     self.cancelled.set()
         if self.cancelled.is_set():
             raise ClientDisconnected()
@@ -1106,6 +1112,8 @@ class Handler(BaseHTTPRequestHandler):
         url = OPENAI[prefix] + self.path[len(prefix):]
         started = time.monotonic()
         chain_id = uuid.uuid4().hex[:16]
+        if cancel is not None:
+            cancel.chain_id = chain_id
         retries = max(0, int((recovery or {}).get('max_retries', 2)))
         window = max(0, float((recovery or {}).get('retry_window', 60)))
 
@@ -1225,6 +1233,11 @@ class Handler(BaseHTTPRequestHandler):
                 error_class = type(e).__name__
                 client_cancelled = cancel is not None and cancel.cancelled.is_set()
                 outcome = 'client_disconnect' if client_cancelled or stage.startswith('write_') else 'disconnect'
+                if client_cancelled:
+                    cancel.handled = True
+                    retry_stop = 'client_cancelled'
+                elif outcome == 'client_disconnect':
+                    retry_stop = 'client_write_failed'
                 # 客户端取消不重放；上游断流只允许在首次交付前恢复。
                 if client_cancelled or stage.startswith('write_') or committed or self.response_started:
                     wait = None
@@ -1243,11 +1256,7 @@ class Handler(BaseHTTPRequestHandler):
                           'chain_id': chain_id, 'stage': stage, 'error_class': error_class,
                           'terminal': probe.terminal_kind, 'delivered_bytes': delivered,
                           'elapsed': round(time.monotonic() - started, 3)}
-                if cancel is not None and cancel.cancelled.is_set():
-                    retry_stop = 'client_cancelled'
-                elif outcome == 'client_disconnect':
-                    retry_stop = 'client_write_failed'
-                elif probe.failure is not None and transient_error(probe.failure) and probe.output:
+                if outcome != 'client_disconnect' and probe.failure is not None and transient_error(probe.failure) and probe.output:
                     retry_stop = 'output_started'
                 if retry_stop is not None:
                     fields['retry_stop'] = retry_stop
@@ -1273,6 +1282,7 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         cancel.wait(wait)
                     except ClientDisconnected:
+                        cancel.handled = True
                         self.close_connection = True
                         self.log(f'{label} -> openai_cancel ' + json.dumps({
                             'chain_id': chain_id, 'attempt': attempt + 1, 'stage': 'retry_wait',
@@ -1299,6 +1309,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.passthrough(prefix, body, headers, label, note, recovery=opts, cancel=cancel)
             finally:
                 gate.release()
+                if cancel.handled and cancel.cancelled_at is not None:
+                    elapsed_ms = round((time.monotonic() - cancel.cancelled_at) * 1000, 3)
+                    self.log(f'{label} -> openai_release ' + json.dumps({
+                        'chain_id': cancel.chain_id, 'reason': 'client_cancelled',
+                        'cancel_to_release_ms': elapsed_ms, **gate.snapshot()}))
 
     def models(self, prefix):
         """ChatGPT 的模型列表 + 我们的模型。上游不可用时用 Codex 自己缓存的列表兜底。"""

@@ -187,6 +187,26 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.wait_idle()
         return [json.loads(row.split(' -> openai ', 1)[1]) for row in self.proxy.logs if ' -> openai {' in row]
 
+    def assert_cancel_release(self, chain_id):
+        # gate.release() 先唤醒等待者，随后才写日志，不能仅以 active=0 判断日志已落盘。
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with self.proxy.lock:
+                rows = [json.loads(row.split(' -> openai_release ', 1)[1]) for row in self.proxy.logs
+                        if ' -> openai_release ' in row]
+            if any(row['chain_id'] == chain_id for row in rows):
+                break
+            time.sleep(.01)
+        released = [row for row in rows if row['chain_id'] == chain_id]
+        self.assertEqual(len(released), 1)
+        row = released[0]
+        self.assertEqual(row['reason'], 'client_cancelled')
+        self.assertGreaterEqual(row['cancel_to_release_ms'], 0)
+        self.assertLess(row['cancel_to_release_ms'], 1000)
+        self.assertGreaterEqual(row['active'], 0)
+        self.assertGreaterEqual(row['waiting'], 0)
+        self.assertEqual(row['runtime_limit'], witches._slots['@openai'].limit)
+
     def test_capacity_before_output_retries_and_keeps_wire_bytes(self):
         self.up.scripts['gpt-x'] = [{'body': CREATED + BUSY}, {'body': CREATED + DONE}]
         raw = zstd.compress(json.dumps({'model': 'gpt-x', 'stream': True, 'input': []}).encode())
@@ -434,6 +454,36 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
                      {'Content-Type': 'application/json'})
         return conn
 
+    def test_close_after_response_preserves_outcome_and_retry_reason(self):
+        original_enter, original_end = witches.ClientWatch.__enter__, witches.Handler.end
+        watches = []
+
+        def enter(watch):
+            watches.append(watch)
+            return original_enter(watch)
+
+        def end(handler):
+            original_end(handler)
+            # 确定性模拟：客户端已收到完整响应，在尝试日志落盘前正常关闭连接。
+            watches[-1].cancelled_at = time.monotonic()
+            watches[-1].cancelled.set()
+
+        cases = [(CREATED + DONE, 'ok', None),
+                 (event('response.incomplete', response={}), 'incomplete', None),
+                 (BUSY, 'stream_error', 'retry_limit')]
+        self.cfg('max_retries = 0\n')
+        with patch.object(witches.ClientWatch, '__enter__', enter), patch.object(witches.Handler, 'end', end):
+            for body, outcome, stop in cases:
+                with self.subTest(outcome=outcome):
+                    self.proxy.logs.clear()
+                    self.up.counts.clear()
+                    self.up.scripts['gpt-x'] = [{'body': body}]
+                    self.assertEqual(self.post()[:2], (200, body))
+                    rows = self.attempt_logs()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual((rows[0]['outcome'], rows[0].get('retry_stop')), (outcome, stop))
+                    self.assertFalse(any(' -> openai_release ' in row for row in self.proxy.logs))
+
     def test_cancelled_capacity_retry_frees_slot_for_waiting_client(self):
         self.cfg(limit=1)
         action = {'stall': 'headers', 'started': threading.Event(), 'closed': threading.Event()}
@@ -455,6 +505,7 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
             cancelled = next(r for r in rows if r['outcome'] == 'client_disconnect')
             self.assertEqual((cancelled['stage'], cancelled['retry_stop']), ('connect', 'client_cancelled'))
             self.assertEqual(self.up.counts['gpt-x'], 2)
+            self.assert_cancel_release(cancelled['chain_id'])
         finally:
             conn.close()
 
@@ -475,6 +526,7 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
                     self.assertEqual((row['outcome'], row['stage'], row['retry_stop']),
                                      ('client_disconnect', 'read_stream', 'client_cancelled'))
                     self.assertEqual((row['delivered_bytes'], self.up.counts['gpt-x']), (0, 1))
+                    self.assert_cancel_release(row['chain_id'])
                 finally:
                     conn.close()
 
@@ -495,6 +547,7 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
                                         for x in self.proxy.logs if ' -> openai_cancel ' in x))
             self.assertEqual(cancelled['stage'], 'retry_wait')
             self.assertEqual(cancelled['chain_id'], rows[0]['chain_id'])
+            self.assert_cancel_release(cancelled['chain_id'])
         finally:
             conn.close()
 
@@ -516,6 +569,7 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         finally:
             conn.close()
             gate.release()
+        self.assertFalse(any(' -> openai_release ' in row for row in self.proxy.logs))
 
     def test_live_client_survives_capacity_backoff_and_still_gets_original_stream(self):
         self.up.scripts['gpt-x'] = [{'body': CREATED + BUSY, 'headers': {'Retry-After': '0.3'}}, {}]
