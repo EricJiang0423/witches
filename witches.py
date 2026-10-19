@@ -739,6 +739,10 @@ def to_chat(req, p, m):
     if p.get('prompt_cache_key') and req.get('prompt_cache_key'):
         body['prompt_cache_key'] = req['prompt_cache_key']
     body.update(m.get('extra', {}))
+    if body.get('tools') and 'deepseek' in m['upstream'].lower():
+        for message in body['messages']:
+            if message['role'] == 'assistant':
+                message.setdefault('reasoning_content', '')
     return body, names
 
 
