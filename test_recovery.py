@@ -109,6 +109,70 @@ class Proxy(witches.Handler):
             self.server.logs.append(msg)
 
 
+class ChatReasoningTests(unittest.TestCase):
+    def test_deepseek_missing_reasoning_in_tool_history(self):
+        request = {'input': [
+            {'type': 'message', 'role': 'user', 'content': 'Check the value.'},
+            {'type': 'reasoning', 'encrypted_content': 'OPAQUE', 'summary': []},
+            {'type': 'message', 'role': 'assistant', 'content': 'Checking.'},
+            {'type': 'function_call', 'call_id': 'call_first', 'name': 'get_value', 'arguments': '{}'},
+            {'type': 'function_call_output', 'call_id': 'call_first', 'output': '7'},
+            {'type': 'custom_tool_call', 'call_id': 'call_second', 'name': 'get_value', 'input': 'check'},
+            {'type': 'custom_tool_call_output', 'call_id': 'call_second', 'output': '7'}],
+            'tools': [{'type': 'function', 'name': 'get_value', 'parameters': {}}]}
+        for upstream in ('deepseek-flash', 'deepseek-v4.1-flash-1017', 'bailian-deepseek-v4.1-flash-1017'):
+            with self.subTest(upstream=upstream):
+                body, _ = witches.to_chat(request, {}, {'upstream': upstream})
+                assistants = [message for message in body['messages'] if message['role'] == 'assistant']
+                self.assertEqual(len(assistants), 2)
+                for message in assistants:
+                    self.assertIn('reasoning_content', message)
+                    self.assertEqual(message['reasoning_content'], '')
+                self.assertNotIn('OPAQUE', json.dumps(body))
+
+    def test_deepseek_reasoning_survives_stream_and_tool_rounds(self):
+        items = [{'type': 'message', 'role': 'user', 'content': 'Check two values.'}]
+        expected = []
+        for index, reasoning in enumerate(('First full thought. 完整推理。', 'Second full thought.')):
+            chunks = [
+                {'choices': [{'delta': {'reasoning_content': reasoning[:8]}}]},
+                {'choices': [{'delta': {'reasoning_content': reasoning[8:]}}]},
+                {'choices': [{'delta': {'content': 'Checking.'}}]},
+                {'choices': [{'delta': {'tool_calls': [{'index': 0, 'function': {
+                    'name': 'get_value', 'arguments': '{}'}}]}, 'finish_reason': 'tool_calls'}]}]
+            stream = ''.join('data: ' + json.dumps(chunk) + '\n\n' for chunk in chunks) + 'data: [DONE]\n\n'
+            emitted = []
+            witches.chat_stream(io.BytesIO(stream.encode()), lambda kind, obj: emitted.append((kind, obj)),
+                                'Pantheon/deepseek-v4.1-flash-1017', {})
+            output = emitted[-1][1]['response']['output']
+            items.extend(output)
+            call = next(item for item in output if item['type'] == 'function_call')
+            items.append({'type': 'function_call_output', 'call_id': call['call_id'], 'output': str(index)})
+            expected.append(reasoning)
+            body, _ = witches.to_chat({'input': items, 'tools': [
+                {'type': 'function', 'name': 'get_value', 'parameters': {}}]}, {},
+                {'upstream': 'deepseek-v4.1-flash-1017'})
+            assistants = [message for message in body['messages'] if message['role'] == 'assistant']
+            self.assertEqual([message['reasoning_content'] for message in assistants], expected)
+            self.assertTrue(all(message['tool_calls'] for message in assistants))
+
+    def test_deepseek_text_only_assistant_history_with_tools(self):
+        request = {'input': [
+            {'type': 'message', 'role': 'assistant', 'content': 'Previous reply.'},
+            {'type': 'message', 'role': 'user', 'content': 'Next question.'}],
+            'tools': [{'type': 'function', 'name': 'get_value', 'parameters': {}}]}
+        body, _ = witches.to_chat(request, {}, {'upstream': 'deepseek-flash'})
+        self.assertEqual(body['messages'][0]['reasoning_content'], '')
+
+    def test_missing_reasoning_compatibility_does_not_change_other_requests(self):
+        request = {'input': [{'type': 'message', 'role': 'assistant', 'content': 'Previous reply.'}]}
+        body, _ = witches.to_chat(request, {}, {'upstream': 'deepseek-flash'})
+        self.assertNotIn('reasoning_content', body['messages'][0])
+        request['tools'] = [{'type': 'function', 'name': 'get_value', 'parameters': {}}]
+        body, _ = witches.to_chat(request, {}, {'upstream': 'glm-5.3'})
+        self.assertNotIn('reasoning_content', body['messages'][0])
+
+
 class RecoveryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
