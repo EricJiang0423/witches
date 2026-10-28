@@ -59,23 +59,31 @@ PROMPT = Path(__file__).resolve().with_name('prompt.md').read_text()  # Codex �
 PANEL = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>witches</title>
 <style>
-:root{--bg:#fff;--fg:#1c1c1e;--mute:#6b6b70;--line:#e3e3e6;--ok:#1a7f4b;--down:#b3261e}
-@media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#ececf0;--mute:#8e8e96;--line:#2c2c30;--ok:#4cc38a;--down:#ff8a80}}
-body{font:15px/1.5 -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:560px;margin:0 auto;padding:24px 16px}
-h1{font-size:18px;margin:0 0 4px}.m{color:var(--mute);font-size:13px}
-table{width:100%;border-collapse:collapse;margin:16px 0}td,th{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line)}
-th{color:var(--mute);font-weight:500;font-size:13px}.ok{color:var(--ok)}.down{color:var(--down)}
+:root{--bg:#fff;--fg:#1c1c1e;--mute:#6b6b70;--line:#e3e3e6;--ok:#1a7f4b;--warn:#b26a00;--down:#b3261e;--bar:#e9e9ec}
+@media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#ececf0;--mute:#8e8e96;--line:#2c2c30;--ok:#4cc38a;--warn:#e0a030;--down:#ff8a80;--bar:#2c2c30}}
+body{font:15px/1.5 -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:640px;margin:0 auto;padding:24px 16px}
+h1{font-size:18px;margin:0 0 4px}h2{font-size:14px;margin:24px 0 0;color:var(--mute);font-weight:500}.m{color:var(--mute);font-size:13px}
+table{width:100%;border-collapse:collapse;margin:8px 0}td,th{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mute);font-weight:500;font-size:13px}.ok{color:var(--ok)}.warn{color:var(--warn)}.down{color:var(--down)}
+.bar{height:6px;background:var(--bar);border-radius:3px;margin-top:4px;min-width:90px}.bar i{display:block;height:100%;border-radius:3px;background:var(--ok)}
 </style>
 <h1>witches</h1><div class=m id=sub>连接中…</div>
-<table><thead><tr><th>#<th>账号<th>状态</thead><tbody id=rows></tbody></table>
+<h2>GPT 账号（按使用顺序）</h2>
+<table><thead><tr><th>#<th>账号<th>5 小时剩余<th>7 天剩余<th>状态</thead><tbody id=rows></tbody></table>
 <div class=m id=gate></div>
+<h2>第三方余额</h2><div id=bal class=m>—</div>
 <script>
-const t=s=>s>=3600?Math.floor(s/3600)+' 小时 '+Math.floor(s%3600/60)+' 分':s>=60?Math.floor(s/60)+' 分 '+s%60+' 秒':s+' 秒';
-async function tick(){try{const h=(await (await fetch('/health')).json()),o=h.openai,a=o.accounts||[];
-sub.textContent='运行中 · pid '+h.pid+' · 每 3 秒刷新';
-rows.innerHTML=a.length?a.map((x,i)=>'<tr><td>'+(i+1)+'<td>'+x.account+'<td class='+(x.down_s?'down':'ok')+'>'+(x.down_s?'额度用完，'+t(x.down_s)+'后恢复':'可用')+'</tr>').join(''):'<tr><td colspan=3 class=m>未配置多账户，GPT 请求使用 Codex 自己的登录态</tr>';
+const t=s=>s==null?'':s>=86400?Math.floor(s/86400)+' 天 '+Math.floor(s%86400/3600)+' 小时':s>=3600?Math.floor(s/3600)+' 小时 '+Math.floor(s%3600/60)+' 分':s>=60?Math.floor(s/60)+' 分':s+' 秒';
+const cls=p=>p>=50?'ok':p>=20?'warn':'down';
+const cell=w=>w?'<span class='+cls(w.remaining_percent)+'>'+w.remaining_percent+'%</span> <span class=m>'+t(w.resets_in_s)+'后重置</span><div class=bar><i style="width:'+w.remaining_percent+'%;background:var(--'+(w.remaining_percent>=50?'ok':w.remaining_percent>=20?'warn':'down')+')"></i></div>':'<span class=m>—</span>';
+async function usage(){try{const u=await (await fetch('/api/usage')).json();
+rows.innerHTML=u.accounts.map((x,i)=>{const w=n=>(x.windows||[]).find(v=>v.name==n);
+return '<tr><td>'+(i+1)+'<td>'+x.account+'<div class=m>'+(x.plan||'')+'</div><td>'+cell(w('5h'))+'<td>'+cell(w('7d'))+'<td class='+(x.down_s||x.limit_reached?'down':x.error?'warn':'ok')+'>'+(x.down_s?'额度用完，'+t(x.down_s)+'后恢复':x.limit_reached?'额度用完':x.error?'查询失败：'+x.error:'可用')+'</tr>'}).join('');
+bal.innerHTML=u.providers.length?u.providers.map(p=>p.provider+'：'+(p.error?'查询失败 '+p.error:p.balances.map(b=>b.total+' '+b.currency).join(' / '))).join('<br>'):'没有支持余额查询的 provider（目前认 DeepSeek）'}catch(e){rows.innerHTML='<tr><td colspan=5 class=m>额度查询失败</tr>'}}
+async function tick(){try{const h=await (await fetch('/health')).json(),o=h.openai;
+sub.textContent='运行中 · pid '+h.pid+' · 额度每 30 秒、状态每 3 秒刷新';
 gate.textContent='GPT 并发 '+o.active+'/'+o.runtime_limit+'，排队 '+o.waiting}catch(e){sub.textContent='无法连接 witches'}}
-tick();setInterval(tick,3000)
+tick();usage();setInterval(tick,3000);setInterval(usage,30000)
 </script>"""
 
 # Codex 自己的压缩提示词与摘要前缀（openai/codex，Apache-2.0）
@@ -463,6 +471,68 @@ def account_headers(path):
             tmp.chmod(0o600)
             os.replace(tmp, path)
     return {'Authorization': f"Bearer {t['access_token']}", 'chatgpt-account-id': t.get('account_id', '')}
+
+
+_usage_cache, _usage_lock = {}, threading.Lock()
+
+
+def window_name(seconds):
+    return {18000: '5h', 604800: '7d'}.get(seconds, f'{seconds}s')
+
+
+def account_usage(acct, fresh=False):
+    """ChatGPT 账号的剩余额度（/wham/usage，Codex 自己用的同一个接口）；成功的结果缓存 60 秒。"""
+    with _usage_lock:
+        hit = _usage_cache.get(acct)
+        if hit and not fresh and time.monotonic() - hit[0] < 60:
+            return hit[1]
+    out = {'account': 'primary' if acct is None else acct.stem}
+    try:
+        if acct is None:
+            t = json.loads((CODEX_HOME / 'auth.json').read_text())['tokens']
+            h = {'Authorization': f"Bearer {t['access_token']}", 'chatgpt-account-id': t.get('account_id', '')}
+        else:
+            h = account_headers(acct)
+        with fetch('GET', OPENAI['/backend-api/codex'].rsplit('/codex', 1)[0] + '/wham/usage', None, h, timeout=10) as r:
+            body = r.read()
+            if r.status != 200:
+                raise OSError(f'HTTP {r.status}')
+        d = json.loads(body)
+        rl = d.get('rate_limit') or {}
+        out.update(plan=d.get('plan_type'), limit_reached=bool(rl.get('limit_reached')), windows=[
+            {'name': window_name(w.get('limit_window_seconds')), 'used_percent': w.get('used_percent'),
+             'remaining_percent': 100 - (w.get('used_percent') or 0), 'resets_in_s': w.get('reset_after_seconds')}
+            for w in (rl.get('primary_window'), rl.get('secondary_window')) if w])
+        with _usage_lock:
+            _usage_cache[acct] = (time.monotonic(), out)
+    except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException) as e:
+        out['error'] = str(e) or type(e).__name__
+    return out
+
+
+def provider_balance(name, p):
+    """目前只认 DeepSeek 的 /user/balance；别家没有统一接口。"""
+    try:
+        with fetch('GET', 'https://api.deepseek.com/user/balance', None,
+                   {'Authorization': f"Bearer {p.get('api_key', '')}"}, timeout=10) as r:
+            infos = json.loads(r.read())['balance_infos']
+        return {'provider': name, 'balances': [{'currency': b['currency'], 'total': b['total_balance']} for b in infos]}
+    except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException) as e:
+        return {'provider': name, 'error': str(e) or type(e).__name__}
+
+
+def usage_report(fresh=False):
+    cfg = config()
+    pool = account_pool(openai_options(cfg))
+    now = time.monotonic()
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        accounts = list(ex.map(lambda a: account_usage(a, fresh), pool))
+        balances = list(ex.map(lambda kv: provider_balance(*kv), [
+            (n, p) for n, p in cfg.get('providers', {}).items() if 'api.deepseek.com' in p.get('base_url', '')]))
+    with _down_lock:
+        for a, row in zip(pool, accounts):
+            row['down_s'] = round(max(0, _down.get(a, 0) - now))
+    return {'accounts': accounts, 'providers': balances}
 
 
 def account_pool(opts):
@@ -1239,6 +1309,8 @@ class Handler(BaseHTTPRequestHandler):
         prefix = next((p for p in OPENAI if self.path.startswith(p + '/') or self.path == p), None)
         if self.path == '/health':
             return self.send_json(200, health())
+        if self.path.split('?')[0] == '/api/usage':  # 只读额度，不含邮箱和令牌
+            return self.send_json(200, usage_report(fresh='refresh=1' in self.path))
         if self.path in ('/', '/panel'):
             return self.send_bytes(200, PANEL.encode(), 'text/html; charset=utf-8')
         if self.headers.get('Upgrade', '').lower() == 'websocket':  # 426 让 Codex 立刻退回 HTTP

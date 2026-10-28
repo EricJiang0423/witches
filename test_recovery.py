@@ -65,6 +65,20 @@ class Upstream(BaseHTTPRequestHandler):
             self.close_connection = True
             action['closed'].set()
 
+    def do_GET(self):
+        if not self.path.endswith('/wham/usage'):
+            return self.send_error(404)
+        with self.server.lock:
+            self.server.seen.append(('usage', b'', dict(self.headers)))
+        hit = self.headers['Authorization'].endswith('.b')
+        body = json.dumps({'plan_type': 'plus', 'rate_limit': {'limit_reached': hit, 'primary_window': {
+            'used_percent': 100 if hit else 30, 'limit_window_seconds': 18000, 'reset_after_seconds': 60},
+            'secondary_window': {'used_percent': 5, 'limit_window_seconds': 604800, 'reset_after_seconds': 99}}}).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         raw = self.rfile.read(int(self.headers['Content-Length']))
         req = json.loads(zstd.decompress(raw) if self.headers.get('Content-Encoding') == 'zstd' else raw)
@@ -249,6 +263,30 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         r = conn.getresponse()
         self.assertEqual((r.status, r.getheader('Content-Type').split(';')[0]), (200, 'text/html'))
         conn.close()
+
+    def test_usage_api_reports_remaining_quota_and_caches(self):
+        self.accounts('b')
+        witches._usage_cache.clear()
+
+        def get(path):
+            conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=10)
+            conn.request('GET', path)
+            try:
+                return json.loads(conn.getresponse().read())
+            finally:
+                conn.close()
+        rows = get('/api/usage')['accounts']
+        self.assertEqual([r['account'] for r in rows], ['primary', 'b'])
+        self.assertEqual(rows[0]['windows'], [
+            {'name': '5h', 'used_percent': 30, 'remaining_percent': 70, 'resets_in_s': 60},
+            {'name': '7d', 'used_percent': 5, 'remaining_percent': 95, 'resets_in_s': 99}])
+        self.assertTrue(rows[1]['limit_reached'])
+        self.assertEqual(rows[1]['windows'][0]['remaining_percent'], 0)
+        self.assertNotIn('TOKEN', json.dumps(rows))
+        get('/api/usage')
+        self.assertEqual(sum(1 for m, _, _ in self.up.seen if m == 'usage'), 2)  # 第二次命中缓存
+        get('/api/usage?refresh=1')
+        self.assertEqual(sum(1 for m, _, _ in self.up.seen if m == 'usage'), 4)
 
     def test_stream_quota_fails_over_and_all_exhausted_returns_original_error(self):
         self.accounts('b')
