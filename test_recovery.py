@@ -239,6 +239,17 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.assertTrue(self.up.seen[0][2]['Authorization'].endswith('.b'))
         self.assertEqual([a['down_s'] > 0 for a in self.health()['openai']['accounts']], [True, False, False])
 
+    def test_primary_position_and_panel(self):
+        self.accounts('b')
+        self.cfg(f'accounts = [{json.dumps(str(witches.HOME / "b.json"))}, "primary"]\n')
+        self.assertTrue(self.post()[1] == CREATED + DONE and self.up.seen[0][2]['Authorization'].endswith('.b'))
+        self.assertEqual([a['account'] for a in self.health()['openai']['accounts']], ['b', 'primary'])
+        conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=5)
+        conn.request('GET', '/panel')
+        r = conn.getresponse()
+        self.assertEqual((r.status, r.getheader('Content-Type').split(';')[0]), (200, 'text/html'))
+        conn.close()
+
     def test_stream_quota_fails_over_and_all_exhausted_returns_original_error(self):
         self.accounts('b')
         err = event('response.failed', response={'error': {'code': 'usage_limit_reached', 'resets_in_seconds': 60}})

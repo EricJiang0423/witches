@@ -56,6 +56,27 @@ STREAM_ERRORS = (OSError, http.client.HTTPException)
 PRELUDE_LIMIT = 262144
 OPENAI_DEFAULTS = {'max_concurrency': 3, 'queue_timeout': 30, 'max_retries': 2, 'retry_window': 60}
 PROMPT = Path(__file__).resolve().with_name('prompt.md').read_text()  # Codex 的基础提示词（openai/codex，Apache-2.0）
+PANEL = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>witches</title>
+<style>
+:root{--bg:#fff;--fg:#1c1c1e;--mute:#6b6b70;--line:#e3e3e6;--ok:#1a7f4b;--down:#b3261e}
+@media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#ececf0;--mute:#8e8e96;--line:#2c2c30;--ok:#4cc38a;--down:#ff8a80}}
+body{font:15px/1.5 -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:560px;margin:0 auto;padding:24px 16px}
+h1{font-size:18px;margin:0 0 4px}.m{color:var(--mute);font-size:13px}
+table{width:100%;border-collapse:collapse;margin:16px 0}td,th{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line)}
+th{color:var(--mute);font-weight:500;font-size:13px}.ok{color:var(--ok)}.down{color:var(--down)}
+</style>
+<h1>witches</h1><div class=m id=sub>连接中…</div>
+<table><thead><tr><th>#<th>账号<th>状态</thead><tbody id=rows></tbody></table>
+<div class=m id=gate></div>
+<script>
+const t=s=>s>=3600?Math.floor(s/3600)+' 小时 '+Math.floor(s%3600/60)+' 分':s>=60?Math.floor(s/60)+' 分 '+s%60+' 秒':s+' 秒';
+async function tick(){try{const h=(await (await fetch('/health')).json()),o=h.openai,a=o.accounts||[];
+sub.textContent='运行中 · pid '+h.pid+' · 每 3 秒刷新';
+rows.innerHTML=a.length?a.map((x,i)=>'<tr><td>'+(i+1)+'<td>'+x.account+'<td class='+(x.down_s?'down':'ok')+'>'+(x.down_s?'额度用完，'+t(x.down_s)+'后恢复':'可用')+'</tr>').join(''):'<tr><td colspan=3 class=m>未配置多账户，GPT 请求使用 Codex 自己的登录态</tr>';
+gate.textContent='GPT 并发 '+o.active+'/'+o.runtime_limit+'，排队 '+o.waiting}catch(e){sub.textContent='无法连接 witches'}}
+tick();setInterval(tick,3000)
+</script>"""
 
 # Codex 自己的压缩提示词与摘要前缀（openai/codex，Apache-2.0）
 COMPACT_PROMPT = """You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
@@ -444,6 +465,14 @@ def account_headers(path):
     return {'Authorization': f"Bearer {t['access_token']}", 'chatgpt-account-id': t.get('account_id', '')}
 
 
+def account_pool(opts):
+    """账号顺序：accounts 里的 "primary" 代表 Codex 自己的登录态，可放在任意位置；没写就排第一。"""
+    names = list(opts.get('accounts') or [])
+    if 'primary' not in names:
+        names.insert(0, 'primary')
+    return [None if n == 'primary' else Path(n).expanduser() for n in names]
+
+
 def choose(pool, h):
     """按顺序取第一个额度没用完的账号：None 是 Codex 自己的登录态（请求头原样），其余是额外账户。"""
     for acct in pool:
@@ -471,9 +500,8 @@ def health():
     if opts.get('accounts'):
         now = time.monotonic()
         with _down_lock:
-            out['accounts'] = [{'account': 'primary', 'down_s': round(max(0, _down.get(None, 0) - now))}] + [
-                {'account': Path(p).expanduser().stem, 'down_s': round(max(0, _down.get(Path(p).expanduser(), 0) - now))}
-                for p in opts['accounts']]
+            out['accounts'] = [{'account': 'primary' if a is None else a.stem, 'down_s': round(max(0, _down.get(a, 0) - now))}
+                               for a in account_pool(opts)]
     return {'ok': True, 'pid': os.getpid(), 'openai': out}
 
 
@@ -1153,6 +1181,13 @@ class Handler(BaseHTTPRequestHandler):
         self.response_started = True
         super().end_headers()
 
+    def send_bytes(self, status, b, ctype):
+        self.send_response(status)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
     def send_json(self, status, obj, headers=None):
         b = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(status)
@@ -1204,6 +1239,8 @@ class Handler(BaseHTTPRequestHandler):
         prefix = next((p for p in OPENAI if self.path.startswith(p + '/') or self.path == p), None)
         if self.path == '/health':
             return self.send_json(200, health())
+        if self.path in ('/', '/panel'):
+            return self.send_bytes(200, PANEL.encode(), 'text/html; charset=utf-8')
         if self.headers.get('Upgrade', '').lower() == 'websocket':  # 426 让 Codex 立刻退回 HTTP
             return self.send_json(426, {'error': {'message': 'witches: HTTP only', 'type': 'witches_error'}})
         if prefix is None:
@@ -1238,7 +1275,7 @@ class Handler(BaseHTTPRequestHandler):
             cancel.chain_id = chain_id
         retries = max(0, int((recovery or {}).get('max_retries', 2)))
         window = max(0, float((recovery or {}).get('retry_window', 60)))
-        pool = [None] + [Path(p).expanduser() for p in (recovery or {}).get('accounts', [])]
+        pool = account_pool(recovery or {})
         switches, acct = 0, None
 
         def failover(err, advice=None):
