@@ -10,6 +10,7 @@ Codex 内置的 openai provider 经 `openai_base_url` 指向本机 witches：
   * [route]：按 Codex 的 x-openai-subagent 头，把子代理/审查请求改派给第三方模型
 """
 import base64
+import datetime
 import hashlib
 import http.client
 import ipaddress
@@ -49,7 +50,7 @@ EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 RETRYABLE = {408, 409, 429, 500, 502, 503, 504, 529}
 CAPACITY_CODES = {'server_overloaded', 'server_is_overloaded', 'model_overloaded', 'overloaded_error',
                   'rate_limit_exceeded', 'slow_down'}
-QUOTA_CODES = {'insufficient_quota', 'quota_exhausted', 'billing_hard_limit_reached',
+QUOTA_CODES = {'usage_limit_reached', 'insufficient_quota', 'quota_exhausted', 'billing_hard_limit_reached',
                'project_spend_limit_exceeded', 'organization_usage_limit_exceeded'}
 STREAM_ERRORS = (OSError, http.client.HTTPException)
 PRELUDE_LIMIT = 262144
@@ -391,6 +392,72 @@ def slot(pname, p):
         return gate
 
 
+CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'  # Codex CLI 的公开 OAuth client id
+ACCOUNT_HEADERS = {'authorization', 'chatgpt-account-id', 'x-codex-turn-state'}  # 换账号时这些属于旧账号
+_down, _down_lock, _refresh_lock = {}, threading.Lock(), threading.Lock()  # 账号 -> 额度恢复的 monotonic 时刻
+
+
+def usable(acct):
+    with _down_lock:
+        return _down.get(acct, 0) <= time.monotonic()
+
+
+def mark_down(acct, seconds):
+    with _down_lock:
+        _down[acct] = time.monotonic() + seconds
+
+
+def quota_wait(err, advice=None):
+    """额度多久恢复：优先用上游给的 resets_in_seconds / resets_at，没有就先歇 10 分钟。"""
+    for v in (err.get('resets_in_seconds'), (err.get('resets_at') or 0) - time.time(), retry_after(advice)):
+        if isinstance(v, (int, float)) and v > 0:
+            return min(v, 7 * 86400)
+    return 600
+
+
+def jwt_exp(token):
+    try:
+        p = token.split('.')[1]
+        return json.loads(base64.urlsafe_b64decode(p + '=' * (-len(p) % 4)))['exp']
+    except (IndexError, ValueError, KeyError, TypeError):
+        return 0
+
+
+def account_headers(path):
+    """额外账户（Codex 格式的 auth.json）的请求头；access token 快过期就用 refresh_token 续，并写回原文件。"""
+    with _refresh_lock:
+        auth = json.loads(path.read_text())
+        t = auth['tokens']
+        if jwt_exp(t['access_token']) - time.time() < 120:
+            r = fetch('POST', 'https://auth.openai.com/oauth/token', json.dumps({
+                'client_id': CLIENT_ID, 'grant_type': 'refresh_token', 'refresh_token': t['refresh_token'],
+                'scope': 'openid profile email'}).encode(), {'Content-Type': 'application/json'}, timeout=15)
+            with r:
+                if r.status != 200:
+                    raise OSError(f'refresh failed: HTTP {r.status}')
+                t.update({k: v for k, v in json.loads(r.read()).items() if k in ('id_token', 'access_token', 'refresh_token')})
+            auth['last_refresh'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            tmp = path.with_name(path.name + '.tmp')
+            tmp.write_text(json.dumps(auth, indent=2))
+            tmp.chmod(0o600)
+            os.replace(tmp, path)
+    return {'Authorization': f"Bearer {t['access_token']}", 'chatgpt-account-id': t.get('account_id', '')}
+
+
+def choose(pool, h):
+    """按顺序取第一个额度没用完的账号：None 是 Codex 自己的登录态（请求头原样），其余是额外账户。"""
+    for acct in pool:
+        if not usable(acct):
+            continue
+        if acct is None:
+            return None, h
+        try:
+            return acct, {**{k: v for k, v in h.items() if k.lower() not in ACCOUNT_HEADERS}, **account_headers(acct)}
+        except (OSError, ValueError, KeyError, http.client.HTTPException):
+            mark_down(acct, 60)  # 文件坏了/续期失败：先跳过一分钟，不拖垮其他账号
+    return None, h  # 全部用完：交给 Codex 自己的登录态，让它看到真实的额度错误
+
+
 def openai_options(cfg):
     return {**OPENAI_DEFAULTS, **cfg.get('openai', {})}
 
@@ -400,7 +467,14 @@ def health():
     with _slots_lock:
         gate = _slots.get('@openai')
     state = gate.snapshot() if gate else {'active': 0, 'waiting': 0, 'runtime_limit': opts['max_concurrency']}
-    return {'ok': True, 'pid': os.getpid(), 'openai': {**{k: opts[k] for k in OPENAI_DEFAULTS}, **state}}
+    out = {**{k: opts[k] for k in OPENAI_DEFAULTS}, **state}
+    if opts.get('accounts'):
+        now = time.monotonic()
+        with _down_lock:
+            out['accounts'] = [{'account': 'primary', 'down_s': round(max(0, _down.get(None, 0) - now))}] + [
+                {'account': Path(p).expanduser().stem, 'down_s': round(max(0, _down.get(Path(p).expanduser(), 0) - now))}
+                for p in opts['accounts']]
+    return {'ok': True, 'pid': os.getpid(), 'openai': out}
 
 
 def retry_after(value):
@@ -427,6 +501,33 @@ def transient_error(err):
     return not codes & QUOTA_CODES and bool(codes & CAPACITY_CODES)
 
 
+def empty_start_event(kind, event):
+    """只延后明确为空的文本/推理壳；工具、密文、未知字段均保持立即交付。"""
+    envelope = {'type', 'sequence_number', 'output_index', 'item_id',
+                'content_index', 'summary_index', 'item', 'part'}
+    if set(event) - envelope:
+        return False
+    if kind == 'response.output_item.added':
+        item = event.get('item')
+        if not isinstance(item, dict) or item.get('status') not in (None, 'in_progress'):
+            return False
+        if item.get('type') == 'reasoning':
+            return not (set(item) - {'type', 'id', 'status', 'summary', 'content', 'encrypted_content'}) and \
+                item.get('summary') in (None, []) and item.get('content') in (None, []) and \
+                item.get('encrypted_content') in (None, '')
+        if item.get('type') == 'message':
+            return not (set(item) - {'type', 'id', 'status', 'role', 'content', 'phase'}) and \
+                item.get('phase') in (None, 'commentary', 'final', 'final_answer') and \
+                item.get('role') == 'assistant' and item.get('content') == []
+    expected = {'response.content_part.added': 'output_text',
+                'response.reasoning_summary_part.added': 'summary_text'}.get(kind)
+    part = event.get('part')
+    return expected is not None and isinstance(part, dict) and \
+        not (set(part) - {'type', 'text', 'annotations', 'logprobs'}) and \
+        part.get('type') == expected and part.get('text') == '' and \
+        part.get('annotations') in (None, []) and part.get('logprobs') in (None, [])
+
+
 class StreamProbe:
     """旁路检查 SSE，原始字节不重编码。只缓冲已知的启动事件，未知事件保守地提交。"""
     def __init__(self):
@@ -434,6 +535,7 @@ class StreamProbe:
         self.output = self.terminal = self.opaque = False
         self.failure = None
         self.terminal_kind = None
+        self.first_output_event = None
 
     def feed(self, data):
         self.buffer += data
@@ -463,9 +565,13 @@ class StreamProbe:
             elif kind in ('response.completed', 'response.incomplete'):
                 self.terminal = self.output = True
                 self.terminal_kind = kind
+            elif empty_start_event(kind, event):
+                pass
             elif kind not in ('response.created', 'response.in_progress', 'response.queued', 'ping') or \
                     (isinstance(event.get('response'), dict) and event['response'].get('output')):
                 self.output = True
+            if self.output and self.first_output_event is None:
+                self.first_output_event = kind if re.fullmatch(r'response\.[a-z_.]{1,80}', kind) else 'unknown'
         if len(self.buffer) > PRELUDE_LIMIT:
             self.opaque = self.output = True
             self.buffer = b''
@@ -1132,13 +1238,24 @@ class Handler(BaseHTTPRequestHandler):
             cancel.chain_id = chain_id
         retries = max(0, int((recovery or {}).get('max_retries', 2)))
         window = max(0, float((recovery or {}).get('retry_window', 60)))
+        pool = [None] + [Path(p).expanduser() for p in (recovery or {}).get('accounts', [])]
+        switches, acct = 0, None
+
+        def failover(err, advice=None):
+            """当前账号额度用完：记下恢复时间，还有别的账号可用就换（换号不占重试次数）。"""
+            nonlocal switches
+            if len(pool) < 2:
+                return False
+            mark_down(acct, quota_wait(err, advice))
+            switches += any(usable(a) for a in pool)
+            return any(usable(a) for a in pool)
 
         def delay(attempt, advice=None):
             nonlocal retry_stop
             wait = retry_after(advice)
             if wait is None:
                 wait = random.uniform(0.5, 1) * min(2 ** (attempt + 1), 15)
-            if attempt >= retries:
+            if attempt - switches >= retries:
                 retry_stop = 'retry_limit'
                 return None
             if time.monotonic() - started + wait >= window:
@@ -1146,7 +1263,8 @@ class Handler(BaseHTTPRequestHandler):
                 return None
             return wait
 
-        for attempt in range(retries + 1):
+        for attempt in range(retries + len(pool)):
+            acct, hh = choose(pool, h)
             r, pending, committed, wait = None, bytearray(), False, None
             probe, outcome = StreamProbe(), 'ok'
             request_id = '-'
@@ -1181,7 +1299,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if cancel is not None:
                     cancel.check()
-                r = fetch(self.command, url, body or None, h, **({'cancel': cancel} if cancel is not None else {}))
+                r = fetch(self.command, url, body or None, hh, **({'cancel': cancel} if cancel is not None else {}))
                 request_id = r.getheader('x-request-id') or r.getheader('x-oai-request-id') or '-'
                 inspect = recovery is not None and self.path.split('?')[0].endswith('/responses') and \
                     r.status == 200 and (r.getheader('Content-Encoding') or 'identity').lower() == 'identity' and \
@@ -1196,7 +1314,10 @@ class Handler(BaseHTTPRequestHandler):
                     except (ValueError, AttributeError):
                         err = {}
                     outcome = 'http_error'
-                    if not {str(err.get('code', '')), str(err.get('type', ''))} & QUOTA_CODES:
+                    if {str(err.get('code', '')), str(err.get('type', ''))} & QUOTA_CODES:
+                        if failover(err, r.getheader('Retry-After')):
+                            wait = 0
+                    else:
                         wait = delay(attempt, r.getheader('Retry-After'))
                     if wait is not None:
                         raise RetryUpstream()
@@ -1228,6 +1349,9 @@ class Handler(BaseHTTPRequestHandler):
                             outcome = 'stream_error'
                             if transient_error(probe.failure):
                                 wait = delay(attempt, r.getheader('Retry-After'))
+                            elif {str(probe.failure.get('code', '')), str(probe.failure.get('type', ''))} & QUOTA_CODES \
+                                    and failover(probe.failure, r.getheader('Retry-After')):
+                                wait = 0
                             if wait is not None:
                                 break
                         if probe.output or probe.failure is not None or len(pending) > PRELUDE_LIMIT:
@@ -1268,12 +1392,15 @@ class Handler(BaseHTTPRequestHandler):
                 elif probe.terminal_kind == 'response.incomplete' and outcome == 'ok':
                     outcome = 'incomplete'
                 fields = {'http': r.status if r else None, 'outcome': outcome, 'attempt': attempt + 1,
+                          'account': 'primary' if acct is None else acct.stem,
                           'committed': committed, 'request_id': request_id,
                           'chain_id': chain_id, 'stage': stage, 'error_class': error_class,
                           'terminal': probe.terminal_kind, 'delivered_bytes': delivered,
                           'elapsed': round(time.monotonic() - started, 3)}
                 if outcome != 'client_disconnect' and probe.failure is not None and transient_error(probe.failure) and probe.output:
                     retry_stop = 'output_started'
+                if probe.first_output_event is not None:
+                    fields['first_output_event'] = probe.first_output_event
                 if retry_stop is not None:
                     fields['retry_stop'] = retry_stop
                 if cancel is not None:

@@ -13,6 +13,10 @@ max_concurrency = 3       # 0 表示不限制；改完对新请求生效
 queue_timeout = 30        # 秒；超时返回 witches_queue_timeout + Retry-After
 max_retries = 2           # 首次输出事件前最多额外重试 2 次；0 可关闭
 retry_window = 60         # 秒；仅在此窗口内安排重试，不是单次模型生成的超时
+# 额外的 ChatGPT 账户（可选）：每个是 Codex 格式的 auth.json（用 CODEX_HOME=某目录 codex login 单独登录得到；
+# 不要复制别的工具正在用的 auth，refresh token 会互相轮换失效）。Codex 自己的登录态永远排第一；
+# 它的额度用完（usage_limit_reached）且还没有输出时，witches 按顺序换下一个账户重放，用完的账户记到恢复时间再回来。
+# accounts = ["~/.witches/accounts/b.json", "~/.witches/accounts/c.json"]
 
 # 子代理/审查改用第三方模型。key 是 Codex 请求头 x-openai-subagent 的值：
 #   collab_spawn = spawn_agent 子代理   guardian = 自动审批审查   review = /review   memory_consolidation = 记忆整理

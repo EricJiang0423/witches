@@ -13,7 +13,7 @@ Codex ──openai_base_url──▶ witches (127.0.0.1:10777) ──┬─▶ c
 [opencodex](https://github.com/lidge-jun/opencodex) 和 [magpie](https://github.com/yetone/magpie) 功能很全，但在 Codex remote（远程服务器开发）的场景里太重：每台机器都要装一整套，还要处理环境变量、令牌、shim、状态文件。witches 只做一件事，尽量不碰 Codex：
 
 - **对 Codex 只改一行**：`config.toml` 顶部加一行 `openai_base_url`，不加 provider、不加模型目录、不改 features。Codex 继续用内置的 `openai` provider，所以**登录态不动、旧线程照常显示和继续**。
-- **GPT 透传与恢复**：请求体字节级透传（连 zstd 压缩一起），保留 `x-codex-turn-state` 粘性路由及上游响应头。为检查流内错误，GPT 请求使用 `Accept-Encoding: identity`；响应体保留原始字节。仅在输出事件交给 Codex 前有限重试，不存会话状态，witches 自己从不生成 429。
+- **GPT 透传与恢复**：请求体字节级透传（连 zstd 压缩一起），保留 `x-codex-turn-state` 粘性路由及上游响应头。为检查流内错误，GPT 请求使用 `Accept-Encoding: identity`；响应体保留原始字节。明确为空的文本/推理启动条目保持缓冲，容量错误可在后台有限重试；首个实质内容、工具调用或未知事件立即交付，此后不重放。缓冲沿用 256 KiB 上限，不增加固定等待，也不存会话状态；witches 自己从不生成 429。
 - **同一线程里随便切模型**：GPT → glm → GPT 都能接着聊。切回 GPT 时，witches 会把第三方留下的推理条目、陌生 id、压缩摘要清理成 OpenAI 认的样子。
 - **单文件**：`witches.py` + `prompt.md`，只需要 [uv](https://docs.astral.sh/uv/)（会自动装 Python 3.14）。每台机器各跑各的，互不影响。
 
@@ -130,6 +130,8 @@ GPT 日志中的 `chain_id` 关联同一请求的全部尝试，`request_id` 是
 明文代理通信修复只影响新生成的 Chat 工具调用；不会把历史中的 `encrypted_content` 猜测转换成明文。已经保存了错误密文类型的旧审批上下文，仍可能需要由 Codex 重建。
 
 只缓冲 `response.created` / `in_progress` / `queued` 和心跳等启动事件，缓冲上限 256 KiB；任何输出条目（包括推理、工具）、未知事件或超出缓冲上限都会提交响应，此后代理不再重放。授权、配额耗尽和无效请求错误不因流内重试而掩盖。完整终态前断流时关闭客户端连接，不伪造成功结束，让 Codex 识别截断；已经收到完整终态时，即使上游缺 HTTP 结束块，也不重放。
+
+**多账户（可选）**：`[openai] accounts = ["~/.witches/accounts/b.json"]`，每个是单独 `CODEX_HOME=… codex login` 得到的 auth.json。Codex 自己的登录态永远排第一、原样透传；它报 `usage_limit_reached`（HTTP 429 或流内 `response.failed`）且还没有任何输出时，witches 换掉 `Authorization` / `chatgpt-account-id` 并去掉 `x-codex-turn-state`，用下一个账户重放，换号不占 `max_retries`。用完的账户按上游给的 `resets_in_seconds` 记下恢复时间（没有就 10 分钟），期间新请求直接走还有额度的账户；全部用完则把主账号的原始错误交给 Codex。access token 过期前会自动用 refresh token 续并写回该文件；`/health` 的 `openai.accounts` 显示各账户还要多久恢复。
 
 `max_concurrency = 0` 关闭并发限制，`max_retries = 0` 关闭 GPT 内部重试。并发设置可热更新；`retry_window` 限制安排重试的时间，不限制一次已开始的模型生成。多台机器或多个 witches 进程共用账号时，需要自行协调总并发。
 

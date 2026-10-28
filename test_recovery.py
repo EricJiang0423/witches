@@ -3,6 +3,7 @@
 # requires-python = ">=3.14"
 # ///
 """本地假上游：流内错误、输出边界、断流和并发；不调用真实模型。"""
+import base64
 import concurrent.futures
 import datetime
 import http.client
@@ -208,6 +209,56 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.assertGreaterEqual(row['waiting'], 0)
         self.assertEqual(row['runtime_limit'], witches._slots['@openai'].limit)
 
+    def accounts(self, *names):
+        """额外账户：Codex 格式的 auth.json，access token 是没过期的假 JWT。"""
+        paths = []
+        for name in names:
+            payload = base64.urlsafe_b64encode(json.dumps({'exp': time.time() + 3600}).encode()).decode().rstrip('=')
+            path = witches.HOME / f'{name}.json'
+            path.write_text(json.dumps({'tokens': {'access_token': f'x.{payload}.{name}', 'refresh_token': 'r',
+                                                   'account_id': f'id-{name}'}}))
+            paths.append(str(path))
+            witches._down.pop(path, None)
+        witches._down.pop(None, None)
+        self.cfg(f'accounts = {json.dumps(paths)}\n')
+
+    def test_quota_fails_over_to_next_account_and_sticks(self):
+        self.accounts('b', 'c')
+        quota = json.dumps({'error': {'type': 'usage_limit_reached', 'resets_in_seconds': 3600}}).encode()
+        self.up.scripts['gpt-x'] = [{'status': 429, 'body': quota}, {}]
+        status, data, _, _ = self.post(headers={'x-codex-turn-state': 'sticky', 'chatgpt-account-id': 'id-a'})
+        self.assertEqual((status, data), (200, CREATED + DONE))
+        first, second = (h for _, _, h in self.up.seen)
+        self.assertEqual((first['Authorization'], first['chatgpt-account-id']), ('Bearer TOKEN', 'id-a'))
+        self.assertTrue(second['Authorization'].endswith('.b'))
+        self.assertEqual(second['chatgpt-account-id'], 'id-b')
+        self.assertNotIn('x-codex-turn-state', second)
+        self.assertEqual([r['account'] for r in self.attempt_logs()], ['primary', 'b'])
+        self.up.seen.clear()  # 之后的请求直接走还有额度的账号，不再先撞一次已知用完的主账号
+        self.assertEqual(self.post()[1], CREATED + DONE)
+        self.assertTrue(self.up.seen[0][2]['Authorization'].endswith('.b'))
+        self.assertEqual([a['down_s'] > 0 for a in self.health()['openai']['accounts']], [True, False, False])
+
+    def test_stream_quota_fails_over_and_all_exhausted_returns_original_error(self):
+        self.accounts('b')
+        err = event('response.failed', response={'error': {'code': 'usage_limit_reached', 'resets_in_seconds': 60}})
+        self.up.scripts['gpt-x'] = [{'body': CREATED + err}, {}]
+        self.assertEqual(self.post()[1], CREATED + DONE)
+        self.assertEqual(len(self.up.seen), 2)
+        quota = json.dumps({'error': {'type': 'usage_limit_reached'}}).encode()
+        self.up.scripts['gpt-x'] = [{'status': 429, 'body': quota}]
+        self.up.counts.clear()
+        self.assertEqual(self.post()[:2], (429, quota))  # 主账号和 b 都已标记用完：用主账号，上游错误原样给 Codex
+        self.assertEqual(self.up.counts['gpt-x'], 1)
+
+    def test_broken_account_file_is_skipped(self):
+        self.accounts('b')
+        (witches.HOME / 'b.json').write_text('not json')
+        quota = json.dumps({'error': {'type': 'usage_limit_reached'}}).encode()
+        self.up.scripts['gpt-x'] = [{'status': 429, 'body': quota}]
+        self.assertEqual(self.post()[:2], (429, quota))
+        self.assertEqual(len(self.up.seen), 2)  # 失败切换后 b 读不出来：回到主账号拿真实错误
+
     def test_capacity_before_output_retries_and_keeps_wire_bytes(self):
         self.up.scripts['gpt-x'] = [{'body': CREATED + BUSY}, {'body': CREATED + DONE}]
         raw = zstd.compress(json.dumps({'model': 'gpt-x', 'stream': True, 'input': []}).encode())
@@ -225,6 +276,57 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.assertIn('server_overloaded', logs)
         self.assertIn('gpt-x-0', logs)
         self.assertNotIn('PRIVATE_MESSAGE', logs)
+
+    def test_empty_semantic_prelude_retries_without_leaking_failed_attempt(self):
+        placeholders = [
+            event('response.output_item.added', item={'type': 'reasoning', 'id': 'r1', 'summary': []}),
+            event('response.output_item.added', item={'type': 'message', 'id': 'm1',
+                  'role': 'assistant', 'status': 'in_progress', 'content': []}),
+            event('response.output_item.added', item={'type': 'message', 'id': 'm2',
+                  'role': 'assistant', 'status': 'in_progress', 'content': [], 'phase': 'commentary'}),
+            event('response.output_item.added', item={'type': 'message', 'id': 'm3',
+                  'role': 'assistant', 'status': 'in_progress', 'content': [], 'phase': 'final_answer'}),
+            event('response.content_part.added', part={'type': 'output_text', 'text': '', 'annotations': []}),
+            event('response.reasoning_summary_part.added', part={'type': 'summary_text', 'text': ''}),
+        ]
+        for placeholder in placeholders:
+            with self.subTest(placeholder=placeholder):
+                self.up.counts.clear()
+                self.up.scripts['gpt-x'] = [{'body': CREATED + placeholder + BUSY},
+                                          {'body': CREATED + OUTPUT + DONE}]
+                self.assertEqual(self.post()[1], CREATED + OUTPUT + DONE)
+                self.assertEqual(self.up.counts['gpt-x'], 2)
+
+    def test_semantic_prelude_does_not_hide_content_tools_or_unknown_fields(self):
+        items = [
+            {'type': 'reasoning', 'summary': [], 'encrypted_content': 'opaque'},
+            {'type': 'reasoning', 'summary': [{'text': 'thinking'}]},
+            {'type': 'message', 'role': 'assistant', 'content': [{'text': 'hello'}]},
+            {'type': 'message', 'role': 'assistant', 'content': [], 'phase': 'future_phase'},
+            {'type': 'function_call', 'name': 'exec', 'arguments': ''},
+            {'type': 'custom_tool_call', 'name': 'exec', 'input': ''},
+            {'type': 'web_search_call', 'status': 'in_progress'},
+            {'type': 'reasoning', 'summary': [], 'future_field': 'unknown'},
+        ]
+        for item in items:
+            with self.subTest(item=item):
+                self.up.counts.clear()
+                body = CREATED + event('response.output_item.added', item=item) + BUSY
+                self.up.scripts['gpt-x'] = [{'body': body}]
+                self.assertEqual(self.post()[1], body)
+                self.assertEqual(self.up.counts['gpt-x'], 1)
+
+    def test_phase_prelude_commits_on_first_actual_delta(self):
+        probe = witches.StreamProbe()
+        start = CREATED + event('response.output_item.added', item={
+            'type': 'message', 'role': 'assistant', 'status': 'in_progress',
+            'content': [], 'phase': 'commentary'})
+        for b in start:
+            probe.feed(bytes([b]))
+        self.assertFalse(probe.output)
+        probe.feed(OUTPUT)
+        self.assertTrue(probe.output)
+        self.assertEqual(probe.first_output_event, 'response.output_text.delta')
 
     def test_exhausted_capacity_returns_last_original_error(self):
         self.up.scripts['gpt-x'] = [{'body': CREATED + BUSY}]
