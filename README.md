@@ -141,7 +141,7 @@ GPT 日志中的 `chain_id` 关联同一请求的全部尝试，`request_id` 是
 - **配置**：表单（端口、vision、GPT 通道、子代理改派、provider 和模型）和 TOML 源码两种方式；api_key 显示成 `••••xxxx#hash`，不改就不会动；保存前校验并留 `config.toml.bak`。表单保存会重新生成文件（不保留注释），要保留注释请用源码模式。
 - **日志**：把日志解析成表格，可按 GPT / 第三方 / 出错筛选、搜索、自动刷新，点一行看原文。
 
-写操作都要令牌，并校验 Host / Origin（防 DNS rebinding 和跨站）；页面适配大屏。额度的 JSON 接口：
+写操作都要令牌，并校验 Host / Origin（防 DNS rebinding 和跨站）；页面适配大屏。通过反向代理用域名访问时，在配置里加 `[panel] hosts = ["witches.example.com"]` 放行该域名（代理只应转发 `/panel`、`/api/`、`/health`，不要把 `/backend-api/` 和 `/v1/` 暴露出去）。额度的 JSON 接口：
 
 ```
 GET /api/usage            各账号 {account, plan, limit_reached, down_s, windows:[{name:"5h"|"7d", used_percent, remaining_percent, resets_in_s}]}，

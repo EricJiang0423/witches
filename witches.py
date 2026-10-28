@@ -1679,8 +1679,10 @@ class Handler(BaseHTTPRequestHandler):
     def api(self, raw):
         port = self.server.server_port
         hosts = {f'{h}:{port}' for h in ('127.0.0.1', 'localhost', '[::1]')}
+        public = {str(h).lower() for h in config().get('panel', {}).get('hosts', [])}  # 反向代理对外的域名，如 witches.example.com
+        origins = {f'http://{h}' for h in hosts} | {f'{scheme}://{h}' for h in public for scheme in ('http', 'https')}
         origin = self.headers.get('Origin')
-        if self.headers.get('Host') not in hosts or origin and origin not in {f'http://{h}' for h in hosts}:
+        if self.headers.get('Host', '').lower() not in hosts | public or origin and origin.lower() not in origins:
             return self.send_json(403, {'error': 'bad host/origin'})  # 防 DNS rebinding / 跨站
         path, _, query = self.path.partition('?')
         authed = hmac.compare_digest(self.headers.get('X-Witches-Token', ''), panel_token())
