@@ -3,12 +3,14 @@
 # requires-python = ">=3.14"
 # ///
 """本地假上游：流内错误、输出边界、断流和并发；不调用真实模型。"""
+import base64
 import concurrent.futures
 import datetime
 import http.client
 import io
 import json
 import os
+import re
 import select
 import socket
 import socketserver
@@ -63,6 +65,20 @@ class Upstream(BaseHTTPRequestHandler):
         finally:
             self.close_connection = True
             action['closed'].set()
+
+    def do_GET(self):
+        if not self.path.endswith('/wham/usage'):
+            return self.send_error(404)
+        with self.server.lock:
+            self.server.seen.append(('usage', b'', dict(self.headers)))
+        hit = self.headers['Authorization'].endswith('.b')
+        body = json.dumps({'plan_type': 'plus', 'rate_limit': {'limit_reached': hit, 'primary_window': {
+            'used_percent': 100 if hit else 30, 'limit_window_seconds': 18000, 'reset_after_seconds': 60},
+            'secondary_window': {'used_percent': 5, 'limit_window_seconds': 604800, 'reset_after_seconds': 99}}}).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         raw = self.rfile.read(int(self.headers['Content-Length']))
@@ -208,6 +224,197 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.assertGreaterEqual(row['waiting'], 0)
         self.assertEqual(row['runtime_limit'], witches._slots['@openai'].limit)
 
+    def accounts(self, *names):
+        """额外账户：Codex 格式的 auth.json，access token 是没过期的假 JWT。"""
+        paths = []
+        for name in names:
+            payload = base64.urlsafe_b64encode(json.dumps({'exp': time.time() + 3600}).encode()).decode().rstrip('=')
+            path = witches.HOME / f'{name}.json'
+            path.write_text(json.dumps({'tokens': {'access_token': f'x.{payload}.{name}', 'refresh_token': 'r',
+                                                   'account_id': f'id-{name}'}}))
+            paths.append(str(path))
+            witches._down.pop(path, None)
+        witches._down.pop(None, None)
+        self.cfg(f'accounts = {json.dumps(paths)}\n')
+
+    def test_quota_fails_over_to_next_account_and_sticks(self):
+        self.accounts('b', 'c')
+        quota = json.dumps({'error': {'type': 'usage_limit_reached', 'resets_in_seconds': 3600}}).encode()
+        self.up.scripts['gpt-x'] = [{'status': 429, 'body': quota}, {}]
+        status, data, _, _ = self.post(headers={'x-codex-turn-state': 'sticky', 'chatgpt-account-id': 'id-a'})
+        self.assertEqual((status, data), (200, CREATED + DONE))
+        first, second = (h for _, _, h in self.up.seen)
+        self.assertEqual((first['Authorization'], first['chatgpt-account-id']), ('Bearer TOKEN', 'id-a'))
+        self.assertTrue(second['Authorization'].endswith('.b'))
+        self.assertEqual(second['chatgpt-account-id'], 'id-b')
+        self.assertNotIn('x-codex-turn-state', second)
+        self.assertEqual([r['account'] for r in self.attempt_logs()], ['codex-login', 'b'])
+        self.up.seen.clear()  # 之后的请求直接走还有额度的账号，不再先撞一次已知用完的主账号
+        self.assertEqual(self.post()[1], CREATED + DONE)
+        self.assertTrue(self.up.seen[0][2]['Authorization'].endswith('.b'))
+        self.assertEqual([a['down_s'] > 0 for a in self.health()['openai']['accounts']], [True, False, False])
+
+    def test_primary_position_and_panel(self):
+        self.accounts('b')
+        self.cfg(f'accounts = [{json.dumps(str(witches.HOME / "b.json"))}, "primary"]\n')
+        self.assertTrue(self.post()[1] == CREATED + DONE and self.up.seen[0][2]['Authorization'].endswith('.b'))
+        self.assertEqual([a['account'] for a in self.health()['openai']['accounts']], ['b', 'codex-login'])
+        conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=5)
+        conn.request('GET', '/panel')
+        r = conn.getresponse()
+        self.assertEqual((r.status, r.getheader('Content-Type').split(';')[0]), (200, 'text/html'))
+        conn.close()
+
+    def test_usage_api_reports_remaining_quota_and_caches(self):
+        self.accounts('b')
+        witches._usage_cache.clear()
+
+        def get(path):
+            conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=10)
+            conn.request('GET', path)
+            try:
+                return json.loads(conn.getresponse().read())
+            finally:
+                conn.close()
+        rows = get('/api/usage')['accounts']
+        self.assertEqual([r['account'] for r in rows], ['codex-login', 'b'])
+        self.assertEqual(rows[0]['windows'], [
+            {'name': '5h', 'used_percent': 30, 'remaining_percent': 70, 'resets_in_s': 60},
+            {'name': '7d', 'used_percent': 5, 'remaining_percent': 95, 'resets_in_s': 99}])
+        self.assertTrue(rows[1]['limit_reached'])
+        self.assertEqual(rows[1]['windows'][0]['remaining_percent'], 0)
+        self.assertNotIn('TOKEN', json.dumps(rows))
+        get('/api/usage')
+        self.assertEqual(sum(1 for m, _, _ in self.up.seen if m == 'usage'), 2)  # 第二次命中缓存
+        get('/api/usage?refresh=1')
+        self.assertEqual(sum(1 for m, _, _ in self.up.seen if m == 'usage'), 4)
+
+    def call(self, method, path, body=None, token=True, host=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=15)
+        headers = {'Host': host or f'127.0.0.1:{self.proxy.server_port}'}
+        if token:
+            headers['X-Witches-Token'] = witches.panel_token()
+        conn.request(method, path, json.dumps(body).encode() if body is not None else None, headers)
+        try:
+            r = conn.getresponse()
+            return r.status, json.loads(r.read() or b'{}')
+        finally:
+            conn.close()
+
+    def test_panel_api_requires_token_and_local_host(self):
+        self.assertEqual(self.call('GET', '/api/state', token=False)[0], 401)
+        self.assertEqual(self.call('PUT', '/api/config', {'text': ''}, token=False)[0], 401)
+        self.assertEqual(self.call('GET', '/api/state', host='evil.example:80')[0], 403)
+        status, usage = self.call('GET', '/api/usage', token=False)
+        self.assertEqual(status, 200)
+        self.assertTrue(all('label' not in a for a in usage['accounts']))
+        self.assertTrue(all('label' in a for a in self.call('GET', '/api/usage')[1]['accounts']))
+
+    def test_panel_config_masks_keys_and_validates(self):
+        f = witches.HOME / 'config.toml'
+        f.write_text(f.read_text().replace('[providers.Fake]\n', '[providers.Fake]\napi_key = "sk-secret-1234"\n'))
+        text = self.call('GET', '/api/config')[1]['text']
+        self.assertNotIn('sk-secret-1234', text)
+        self.assertIn('••••1234#', text)
+        self.assertEqual(self.call('PUT', '/api/config', {'text': text + '# edited\n'})[0], 200)
+        self.assertIn('api_key = "sk-secret-1234"', f.read_text())  # 隐藏的 key 原样还原
+        self.assertTrue(f.with_name('config.toml.bak').exists())
+        before = f.read_text()
+        self.assertEqual(self.call('PUT', '/api/config', {'text': 'oops = ['})[0], 400)
+        self.assertEqual(self.call('PUT', '/api/config', {'text': re.sub(r'(••••1234#)[0-9a-f]{6}', r'\g<1>000000', text)})[0], 400)
+        self.assertEqual(f.read_text(), before)
+
+    def test_panel_accounts_import_reorder_delete(self):
+        auth = {'tokens': {'access_token': 'a', 'refresh_token': 'r', 'account_id': 'x'}}
+        self.assertEqual(self.call('POST', '/api/accounts', {'name': 'bad name', 'auth': auth})[0], 400)
+        self.assertEqual(self.call('POST', '/api/accounts', {'name': 'pc', 'auth': {'tokens': {}}})[0], 400)
+        self.assertEqual(self.call('POST', '/api/accounts', {'name': 'pc', 'auth': json.dumps(auth)})[0], 200)
+        self.assertEqual(self.call('POST', '/api/accounts', {'name': 'pc', 'auth': auth})[0], 409)
+        accounts = self.call('GET', '/api/state')[1]['accounts']
+        self.assertEqual([(a['label'], a['codex_login']) for a in accounts], [('codex-login', True), ('pc', False)])
+        refs = [a['ref'] for a in accounts]
+        self.assertEqual(self.call('PUT', '/api/accounts', {'order': refs[::-1]})[0], 200)
+        self.assertEqual([a['label'] for a in self.call('GET', '/api/state')[1]['accounts']], ['pc', 'codex-login'])
+        self.assertEqual(self.call('PUT', '/api/accounts', {'order': ['x']})[0], 400)
+        self.assertEqual(self.call('DELETE', '/api/accounts', {'ref': refs[0]})[0], 400)  # Codex 登录态不能删
+        self.assertEqual(self.call('DELETE', '/api/accounts', {'ref': refs[1]})[0], 200)
+        self.assertFalse((witches.HOME / 'accounts' / 'pc.json').exists())
+        self.assertEqual([a['label'] for a in self.call('GET', '/api/state')[1]['accounts']], ['codex-login'])
+
+    def test_panel_models_log_codex_and_restart(self):
+        state = self.call('GET', '/api/state')[1]
+        self.assertEqual({m['slug'] for m in state['models']}, {'Fake/chat', 'Fake/responses'})
+        self.assertEqual(self.call('POST', '/api/test', {'model': 'gpt-x'})[0], 400)  # GPT 不在这里测
+        self.up.scripts['responses'] = [{}]
+        self.assertTrue(self.call('POST', '/api/test', {'model': 'Fake/responses'})[1]['ok'])
+        (witches.HOME / 'witches.log').write_text('line one\nline two\n')
+        self.assertEqual(self.call('GET', '/api/log?n=1')[1]['lines'], ['line two'])
+        self.assertTrue(self.call('POST', '/api/codex', {'on': True})[1]['wired'])
+        self.assertFalse(self.call('POST', '/api/codex', {'on': False})[1]['wired'])
+        with patch('witches.managed', return_value=False):
+            self.assertEqual(self.call('POST', '/api/restart')[0], 409)  # 不会真的退出测试进程
+
+    def test_disabled_accounts_are_skipped_but_kept(self):
+        self.accounts('b')
+        refs = {a['label']: a['ref'] for a in self.call('GET', '/api/state')[1]['accounts']}
+        self.assertEqual(self.call('POST', '/api/accounts/toggle', {'ref': refs['b'], 'disabled': True})[0], 200)
+        self.assertEqual([(a['label'], a['disabled']) for a in self.call('GET', '/api/state')[1]['accounts']],
+                         [('codex-login', False), ('b', True)])
+        self.assertEqual(self.post()[1], CREATED + DONE)
+        self.assertEqual(self.up.seen[-1][2]['Authorization'], 'Bearer TOKEN')  # b 停用：不会用到
+        self.assertEqual([a['account'] for a in self.health()['openai']['accounts']], ['codex-login'])
+        usage = self.call('GET', '/api/usage')[1]['accounts']
+        self.assertEqual([(a['account'], a['disabled']) for a in usage], [('codex-login', False), ('b', True)])
+        # 停用 Codex 自己的登录态、启用 b：请求走 b
+        self.call('POST', '/api/accounts/toggle', {'ref': refs['b'], 'disabled': False})
+        self.call('POST', '/api/accounts/toggle', {'ref': refs['codex-login'], 'disabled': True})
+        self.assertEqual(self.post()[1], CREATED + DONE)
+        self.assertTrue(self.up.seen[-1][2]['Authorization'].endswith('.b'))
+        # 全部停用：退回 Codex 自己的登录态，请求不会因此失败
+        self.call('POST', '/api/accounts/toggle', {'ref': refs['b'], 'disabled': True})
+        self.assertEqual(self.post()[1], CREATED + DONE)
+        self.assertEqual(self.up.seen[-1][2]['Authorization'], 'Bearer TOKEN')
+        self.assertEqual(self.call('POST', '/api/accounts/toggle', {'ref': 'nope', 'disabled': True})[0], 400)
+
+    def test_structured_config_roundtrip_and_dumper(self):
+        f = witches.HOME / 'config.toml'
+        f.write_text(f.read_text().replace('[providers.Fake]\n', '[providers.Fake]\napi_key = "sk-secret-1234"\n'))
+        data = self.call('GET', '/api/config')[1]['data']
+        self.assertEqual(data['providers']['Fake']['api_key'][:4], '••••')
+        data['openai']['max_retries'] = 7
+        data['providers']['Fake']['models']['new.model'] = {'context': 1000, 'images': True, 'fallback': ['Fake/chat']}
+        self.assertEqual(self.call('PUT', '/api/config', {'data': data})[0], 200)
+        saved = witches.tomllib.loads(f.read_text())
+        self.assertEqual(saved['openai']['max_retries'], 7)
+        self.assertEqual(saved['providers']['Fake']['api_key'], 'sk-secret-1234')
+        self.assertEqual(saved['providers']['Fake']['models']['new.model'], {'context': 1000, 'images': True, 'fallback': ['Fake/chat']})
+        self.assertEqual(saved['providers']['Fake']['models']['responses'], {'wire': 'responses'})
+        data['providers']['Fake']['api_key'] = '••••9999#abcdef'
+        self.assertEqual(self.call('PUT', '/api/config', {'data': data})[0], 400)
+        sample = {'port': 1, 'vision': ['a/b'], 'route': {'review': 'P/glm-5.3'}, 'providers': {'P': {
+            'base_url': 'u', 'models': {'glm-5.3': {'efforts': {'low': 'x'}, 'images': True}, 'with space': {}}}}}
+        self.assertEqual(witches.tomllib.loads(witches.dump_checked(sample)), sample)
+
+    def test_stream_quota_fails_over_and_all_exhausted_returns_original_error(self):
+        self.accounts('b')
+        err = event('response.failed', response={'error': {'code': 'usage_limit_reached', 'resets_in_seconds': 60}})
+        self.up.scripts['gpt-x'] = [{'body': CREATED + err}, {}]
+        self.assertEqual(self.post()[1], CREATED + DONE)
+        self.assertEqual(len(self.up.seen), 2)
+        quota = json.dumps({'error': {'type': 'usage_limit_reached'}}).encode()
+        self.up.scripts['gpt-x'] = [{'status': 429, 'body': quota}]
+        self.up.counts.clear()
+        self.assertEqual(self.post()[:2], (429, quota))  # 主账号和 b 都已标记用完：用主账号，上游错误原样给 Codex
+        self.assertEqual(self.up.counts['gpt-x'], 1)
+
+    def test_broken_account_file_is_skipped(self):
+        self.accounts('b')
+        (witches.HOME / 'b.json').write_text('not json')
+        quota = json.dumps({'error': {'type': 'usage_limit_reached'}}).encode()
+        self.up.scripts['gpt-x'] = [{'status': 429, 'body': quota}]
+        self.assertEqual(self.post()[:2], (429, quota))
+        self.assertEqual(len(self.up.seen), 2)  # 失败切换后 b 读不出来：回到主账号拿真实错误
+
     def test_capacity_before_output_retries_and_keeps_wire_bytes(self):
         self.up.scripts['gpt-x'] = [{'body': CREATED + BUSY}, {'body': CREATED + DONE}]
         raw = zstd.compress(json.dumps({'model': 'gpt-x', 'stream': True, 'input': []}).encode())
@@ -225,6 +432,57 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.assertIn('server_overloaded', logs)
         self.assertIn('gpt-x-0', logs)
         self.assertNotIn('PRIVATE_MESSAGE', logs)
+
+    def test_empty_semantic_prelude_retries_without_leaking_failed_attempt(self):
+        placeholders = [
+            event('response.output_item.added', item={'type': 'reasoning', 'id': 'r1', 'summary': []}),
+            event('response.output_item.added', item={'type': 'message', 'id': 'm1',
+                  'role': 'assistant', 'status': 'in_progress', 'content': []}),
+            event('response.output_item.added', item={'type': 'message', 'id': 'm2',
+                  'role': 'assistant', 'status': 'in_progress', 'content': [], 'phase': 'commentary'}),
+            event('response.output_item.added', item={'type': 'message', 'id': 'm3',
+                  'role': 'assistant', 'status': 'in_progress', 'content': [], 'phase': 'final_answer'}),
+            event('response.content_part.added', part={'type': 'output_text', 'text': '', 'annotations': []}),
+            event('response.reasoning_summary_part.added', part={'type': 'summary_text', 'text': ''}),
+        ]
+        for placeholder in placeholders:
+            with self.subTest(placeholder=placeholder):
+                self.up.counts.clear()
+                self.up.scripts['gpt-x'] = [{'body': CREATED + placeholder + BUSY},
+                                          {'body': CREATED + OUTPUT + DONE}]
+                self.assertEqual(self.post()[1], CREATED + OUTPUT + DONE)
+                self.assertEqual(self.up.counts['gpt-x'], 2)
+
+    def test_semantic_prelude_does_not_hide_content_tools_or_unknown_fields(self):
+        items = [
+            {'type': 'reasoning', 'summary': [], 'encrypted_content': 'opaque'},
+            {'type': 'reasoning', 'summary': [{'text': 'thinking'}]},
+            {'type': 'message', 'role': 'assistant', 'content': [{'text': 'hello'}]},
+            {'type': 'message', 'role': 'assistant', 'content': [], 'phase': 'future_phase'},
+            {'type': 'function_call', 'name': 'exec', 'arguments': ''},
+            {'type': 'custom_tool_call', 'name': 'exec', 'input': ''},
+            {'type': 'web_search_call', 'status': 'in_progress'},
+            {'type': 'reasoning', 'summary': [], 'future_field': 'unknown'},
+        ]
+        for item in items:
+            with self.subTest(item=item):
+                self.up.counts.clear()
+                body = CREATED + event('response.output_item.added', item=item) + BUSY
+                self.up.scripts['gpt-x'] = [{'body': body}]
+                self.assertEqual(self.post()[1], body)
+                self.assertEqual(self.up.counts['gpt-x'], 1)
+
+    def test_phase_prelude_commits_on_first_actual_delta(self):
+        probe = witches.StreamProbe()
+        start = CREATED + event('response.output_item.added', item={
+            'type': 'message', 'role': 'assistant', 'status': 'in_progress',
+            'content': [], 'phase': 'commentary'})
+        for b in start:
+            probe.feed(bytes([b]))
+        self.assertFalse(probe.output)
+        probe.feed(OUTPUT)
+        self.assertTrue(probe.output)
+        self.assertEqual(probe.first_output_event, 'response.output_text.delta')
 
     def test_exhausted_capacity_returns_last_original_error(self):
         self.up.scripts['gpt-x'] = [{'body': CREATED + BUSY}]
