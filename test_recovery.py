@@ -310,6 +310,21 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.assertTrue(all('label' not in a for a in usage['accounts']))
         self.assertTrue(all('label' in a for a in self.call('GET', '/api/usage')[1]['accounts']))
 
+    def test_panel_public_host_is_opt_in(self):
+        host = 'witches.example.test'
+        self.assertEqual(self.call('GET', '/api/state', host=host)[0], 403)
+        self.cfg('')
+        (witches.HOME / 'config.toml').write_text((witches.HOME / 'config.toml').read_text() + f'\n[panel]\nhosts = ["{host}"]\n')
+        self.assertEqual(self.call('GET', '/api/state', host=host)[0], 200)
+        conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=5)
+        for origin, want in ((f'https://{host}', 200), ('https://evil.example', 403)):
+            conn.request('PUT', '/api/accounts', json.dumps({'order': witches.account_refs()}), {
+                'Host': host, 'Origin': origin, 'X-Witches-Token': witches.panel_token()})
+            r = conn.getresponse()
+            r.read()
+            self.assertEqual(r.status, want)
+        conn.close()
+
     def test_panel_config_masks_keys_and_validates(self):
         f = witches.HOME / 'config.toml'
         f.write_text(f.read_text().replace('[providers.Fake]\n', '[providers.Fake]\napi_key = "sk-secret-1234"\n'))
