@@ -10,6 +10,7 @@ import http.client
 import io
 import json
 import os
+import re
 import select
 import socket
 import socketserver
@@ -247,7 +248,7 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.assertTrue(second['Authorization'].endswith('.b'))
         self.assertEqual(second['chatgpt-account-id'], 'id-b')
         self.assertNotIn('x-codex-turn-state', second)
-        self.assertEqual([r['account'] for r in self.attempt_logs()], ['primary', 'b'])
+        self.assertEqual([r['account'] for r in self.attempt_logs()], ['codex-login', 'b'])
         self.up.seen.clear()  # 之后的请求直接走还有额度的账号，不再先撞一次已知用完的主账号
         self.assertEqual(self.post()[1], CREATED + DONE)
         self.assertTrue(self.up.seen[0][2]['Authorization'].endswith('.b'))
@@ -257,7 +258,7 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.accounts('b')
         self.cfg(f'accounts = [{json.dumps(str(witches.HOME / "b.json"))}, "primary"]\n')
         self.assertTrue(self.post()[1] == CREATED + DONE and self.up.seen[0][2]['Authorization'].endswith('.b'))
-        self.assertEqual([a['account'] for a in self.health()['openai']['accounts']], ['b', 'primary'])
+        self.assertEqual([a['account'] for a in self.health()['openai']['accounts']], ['b', 'codex-login'])
         conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=5)
         conn.request('GET', '/panel')
         r = conn.getresponse()
@@ -276,7 +277,7 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
             finally:
                 conn.close()
         rows = get('/api/usage')['accounts']
-        self.assertEqual([r['account'] for r in rows], ['primary', 'b'])
+        self.assertEqual([r['account'] for r in rows], ['codex-login', 'b'])
         self.assertEqual(rows[0]['windows'], [
             {'name': '5h', 'used_percent': 30, 'remaining_percent': 70, 'resets_in_s': 60},
             {'name': '7d', 'used_percent': 5, 'remaining_percent': 95, 'resets_in_s': 99}])
@@ -287,6 +288,112 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
         self.assertEqual(sum(1 for m, _, _ in self.up.seen if m == 'usage'), 2)  # 第二次命中缓存
         get('/api/usage?refresh=1')
         self.assertEqual(sum(1 for m, _, _ in self.up.seen if m == 'usage'), 4)
+
+    def call(self, method, path, body=None, token=True, host=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=15)
+        headers = {'Host': host or f'127.0.0.1:{self.proxy.server_port}'}
+        if token:
+            headers['X-Witches-Token'] = witches.panel_token()
+        conn.request(method, path, json.dumps(body).encode() if body is not None else None, headers)
+        try:
+            r = conn.getresponse()
+            return r.status, json.loads(r.read() or b'{}')
+        finally:
+            conn.close()
+
+    def test_panel_api_requires_token_and_local_host(self):
+        self.assertEqual(self.call('GET', '/api/state', token=False)[0], 401)
+        self.assertEqual(self.call('PUT', '/api/config', {'text': ''}, token=False)[0], 401)
+        self.assertEqual(self.call('GET', '/api/state', host='evil.example:80')[0], 403)
+        status, usage = self.call('GET', '/api/usage', token=False)
+        self.assertEqual(status, 200)
+        self.assertTrue(all('label' not in a for a in usage['accounts']))
+        self.assertTrue(all('label' in a for a in self.call('GET', '/api/usage')[1]['accounts']))
+
+    def test_panel_config_masks_keys_and_validates(self):
+        f = witches.HOME / 'config.toml'
+        f.write_text(f.read_text().replace('[providers.Fake]\n', '[providers.Fake]\napi_key = "sk-secret-1234"\n'))
+        text = self.call('GET', '/api/config')[1]['text']
+        self.assertNotIn('sk-secret-1234', text)
+        self.assertIn('••••1234#', text)
+        self.assertEqual(self.call('PUT', '/api/config', {'text': text + '# edited\n'})[0], 200)
+        self.assertIn('api_key = "sk-secret-1234"', f.read_text())  # 隐藏的 key 原样还原
+        self.assertTrue(f.with_name('config.toml.bak').exists())
+        before = f.read_text()
+        self.assertEqual(self.call('PUT', '/api/config', {'text': 'oops = ['})[0], 400)
+        self.assertEqual(self.call('PUT', '/api/config', {'text': re.sub(r'(••••1234#)[0-9a-f]{6}', r'\g<1>000000', text)})[0], 400)
+        self.assertEqual(f.read_text(), before)
+
+    def test_panel_accounts_import_reorder_delete(self):
+        auth = {'tokens': {'access_token': 'a', 'refresh_token': 'r', 'account_id': 'x'}}
+        self.assertEqual(self.call('POST', '/api/accounts', {'name': 'bad name', 'auth': auth})[0], 400)
+        self.assertEqual(self.call('POST', '/api/accounts', {'name': 'pc', 'auth': {'tokens': {}}})[0], 400)
+        self.assertEqual(self.call('POST', '/api/accounts', {'name': 'pc', 'auth': json.dumps(auth)})[0], 200)
+        self.assertEqual(self.call('POST', '/api/accounts', {'name': 'pc', 'auth': auth})[0], 409)
+        accounts = self.call('GET', '/api/state')[1]['accounts']
+        self.assertEqual([(a['label'], a['codex_login']) for a in accounts], [('codex-login', True), ('pc', False)])
+        refs = [a['ref'] for a in accounts]
+        self.assertEqual(self.call('PUT', '/api/accounts', {'order': refs[::-1]})[0], 200)
+        self.assertEqual([a['label'] for a in self.call('GET', '/api/state')[1]['accounts']], ['pc', 'codex-login'])
+        self.assertEqual(self.call('PUT', '/api/accounts', {'order': ['x']})[0], 400)
+        self.assertEqual(self.call('DELETE', '/api/accounts', {'ref': refs[0]})[0], 400)  # Codex 登录态不能删
+        self.assertEqual(self.call('DELETE', '/api/accounts', {'ref': refs[1]})[0], 200)
+        self.assertFalse((witches.HOME / 'accounts' / 'pc.json').exists())
+        self.assertEqual([a['label'] for a in self.call('GET', '/api/state')[1]['accounts']], ['codex-login'])
+
+    def test_panel_models_log_codex_and_restart(self):
+        state = self.call('GET', '/api/state')[1]
+        self.assertEqual({m['slug'] for m in state['models']}, {'Fake/chat', 'Fake/responses'})
+        self.assertEqual(self.call('POST', '/api/test', {'model': 'gpt-x'})[0], 400)  # GPT 不在这里测
+        self.up.scripts['responses'] = [{}]
+        self.assertTrue(self.call('POST', '/api/test', {'model': 'Fake/responses'})[1]['ok'])
+        (witches.HOME / 'witches.log').write_text('line one\nline two\n')
+        self.assertEqual(self.call('GET', '/api/log?n=1')[1]['lines'], ['line two'])
+        self.assertTrue(self.call('POST', '/api/codex', {'on': True})[1]['wired'])
+        self.assertFalse(self.call('POST', '/api/codex', {'on': False})[1]['wired'])
+        with patch('witches.managed', return_value=False):
+            self.assertEqual(self.call('POST', '/api/restart')[0], 409)  # 不会真的退出测试进程
+
+    def test_disabled_accounts_are_skipped_but_kept(self):
+        self.accounts('b')
+        refs = {a['label']: a['ref'] for a in self.call('GET', '/api/state')[1]['accounts']}
+        self.assertEqual(self.call('POST', '/api/accounts/toggle', {'ref': refs['b'], 'disabled': True})[0], 200)
+        self.assertEqual([(a['label'], a['disabled']) for a in self.call('GET', '/api/state')[1]['accounts']],
+                         [('codex-login', False), ('b', True)])
+        self.assertEqual(self.post()[1], CREATED + DONE)
+        self.assertEqual(self.up.seen[-1][2]['Authorization'], 'Bearer TOKEN')  # b 停用：不会用到
+        self.assertEqual([a['account'] for a in self.health()['openai']['accounts']], ['codex-login'])
+        usage = self.call('GET', '/api/usage')[1]['accounts']
+        self.assertEqual([(a['account'], a['disabled']) for a in usage], [('codex-login', False), ('b', True)])
+        # 停用 Codex 自己的登录态、启用 b：请求走 b
+        self.call('POST', '/api/accounts/toggle', {'ref': refs['b'], 'disabled': False})
+        self.call('POST', '/api/accounts/toggle', {'ref': refs['codex-login'], 'disabled': True})
+        self.assertEqual(self.post()[1], CREATED + DONE)
+        self.assertTrue(self.up.seen[-1][2]['Authorization'].endswith('.b'))
+        # 全部停用：退回 Codex 自己的登录态，请求不会因此失败
+        self.call('POST', '/api/accounts/toggle', {'ref': refs['b'], 'disabled': True})
+        self.assertEqual(self.post()[1], CREATED + DONE)
+        self.assertEqual(self.up.seen[-1][2]['Authorization'], 'Bearer TOKEN')
+        self.assertEqual(self.call('POST', '/api/accounts/toggle', {'ref': 'nope', 'disabled': True})[0], 400)
+
+    def test_structured_config_roundtrip_and_dumper(self):
+        f = witches.HOME / 'config.toml'
+        f.write_text(f.read_text().replace('[providers.Fake]\n', '[providers.Fake]\napi_key = "sk-secret-1234"\n'))
+        data = self.call('GET', '/api/config')[1]['data']
+        self.assertEqual(data['providers']['Fake']['api_key'][:4], '••••')
+        data['openai']['max_retries'] = 7
+        data['providers']['Fake']['models']['new.model'] = {'context': 1000, 'images': True, 'fallback': ['Fake/chat']}
+        self.assertEqual(self.call('PUT', '/api/config', {'data': data})[0], 200)
+        saved = witches.tomllib.loads(f.read_text())
+        self.assertEqual(saved['openai']['max_retries'], 7)
+        self.assertEqual(saved['providers']['Fake']['api_key'], 'sk-secret-1234')
+        self.assertEqual(saved['providers']['Fake']['models']['new.model'], {'context': 1000, 'images': True, 'fallback': ['Fake/chat']})
+        self.assertEqual(saved['providers']['Fake']['models']['responses'], {'wire': 'responses'})
+        data['providers']['Fake']['api_key'] = '••••9999#abcdef'
+        self.assertEqual(self.call('PUT', '/api/config', {'data': data})[0], 400)
+        sample = {'port': 1, 'vision': ['a/b'], 'route': {'review': 'P/glm-5.3'}, 'providers': {'P': {
+            'base_url': 'u', 'models': {'glm-5.3': {'efforts': {'low': 'x'}, 'images': True}, 'with space': {}}}}}
+        self.assertEqual(witches.tomllib.loads(witches.dump_checked(sample)), sample)
 
     def test_stream_quota_fails_over_and_all_exhausted_returns_original_error(self):
         self.accounts('b')

@@ -12,12 +12,14 @@ Codex 内置的 openai provider 经 `openai_base_url` 指向本机 witches：
 import base64
 import datetime
 import hashlib
+import hmac
 import http.client
 import ipaddress
 import json
 import os
 import random
 import re
+import secrets
 import select
 import shutil
 import socket
@@ -56,34 +58,129 @@ STREAM_ERRORS = (OSError, http.client.HTTPException)
 PRELUDE_LIMIT = 262144
 OPENAI_DEFAULTS = {'max_concurrency': 3, 'queue_timeout': 30, 'max_retries': 2, 'retry_window': 60}
 PROMPT = Path(__file__).resolve().with_name('prompt.md').read_text()  # Codex 的基础提示词（openai/codex，Apache-2.0）
-PANEL = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+PANEL = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>witches</title>
 <style>
-:root{--bg:#fff;--fg:#1c1c1e;--mute:#6b6b70;--line:#e3e3e6;--ok:#1a7f4b;--warn:#b26a00;--down:#b3261e;--bar:#e9e9ec}
-@media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#ececf0;--mute:#8e8e96;--line:#2c2c30;--ok:#4cc38a;--warn:#e0a030;--down:#ff8a80;--bar:#2c2c30}}
-body{font:15px/1.5 -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:640px;margin:0 auto;padding:24px 16px}
-h1{font-size:18px;margin:0 0 4px}h2{font-size:14px;margin:24px 0 0;color:var(--mute);font-weight:500}.m{color:var(--mute);font-size:13px}
-table{width:100%;border-collapse:collapse;margin:8px 0}td,th{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--mute);font-weight:500;font-size:13px}.ok{color:var(--ok)}.warn{color:var(--warn)}.down{color:var(--down)}
-.bar{height:6px;background:var(--bar);border-radius:3px;margin-top:4px;min-width:90px}.bar i{display:block;height:100%;border-radius:3px;background:var(--ok)}
+:root{--bg:#fff;--fg:#1c1c1e;--mute:#6b6b70;--line:#e3e3e6;--ok:#1a7f4b;--warn:#b26a00;--down:#b3261e;--bar:#e9e9ec;--card:#f6f6f8;--acc:#2f5bea}
+@media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#ececf0;--mute:#8e8e96;--line:#2c2c30;--ok:#4cc38a;--warn:#e0a030;--down:#ff8a80;--bar:#2c2c30;--card:#1f1f22;--acc:#7c9cff}}
+*{box-sizing:border-box}
+body{font:15px/1.55 -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:820px;margin:0 auto;padding:20px 16px 56px}
+@media(min-width:1100px){body{max-width:1180px;font-size:16px}}
+@media(min-width:1600px){body{max-width:1560px;font-size:18px;padding-top:32px}}
+@media(min-width:2200px){body{max-width:2000px;font-size:21px}}
+h1{font-size:1.2em;margin:0}h2{font-size:.9em;margin:0 0 8px;color:var(--mute);font-weight:500}.m{color:var(--mute);font-size:.85em}
+nav{display:flex;gap:4px;margin:14px 0 18px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--mute);padding:8px 14px;font:inherit;cursor:pointer}
+nav button.on{color:var(--fg);border-color:var(--acc)}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mute);font-weight:500;font-size:.85em}.ok{color:var(--ok)}.warn{color:var(--warn)}.down{color:var(--down)}
+.bar{height:6px;background:var(--bar);border-radius:3px;margin-top:4px;min-width:80px}.bar i{display:block;height:100%;border-radius:3px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}.card.wide{grid-column:1/-1}
+.card table td,.card table th{border-color:var(--line)}
+button.b{font:inherit;font-size:.85em;padding:4px 12px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);cursor:pointer}
+button.b:hover:not(:disabled){border-color:var(--acc)}button.b:disabled{opacity:.4;cursor:default}button.p{background:var(--acc);border-color:var(--acc);color:#fff}button.d{color:var(--down)}
+input,textarea,select{font:inherit;font-size:.9em;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);min-width:0}
+input[type=checkbox],.f input[type=checkbox]{width:auto;accent-color:var(--acc)}
+.f{display:grid;grid-template-columns:140px 1fr;gap:6px 12px;align-items:center;margin:6px 0}.f input,.f select{width:100%}.f label{color:var(--mute);font-size:.85em}
+textarea.src{width:100%;font:.8em/1.55 ui-monospace,Menlo,monospace;min-height:62vh}
+.row{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}.grow{flex:1}.right{margin-left:auto}
+#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:8px 16px;border-radius:8px;font-size:.85em;display:none;max-width:90%;z-index:9}
+section{display:none}section.on{display:block}
+.sw{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:.85em}
+.pill{display:inline-block;padding:0 8px;border-radius:10px;font-size:.78em;border:1px solid var(--line);color:var(--mute)}
+.off td{opacity:.5}
+.log td{padding:4px 8px;font:.8em/1.5 ui-monospace,Menlo,monospace;border-bottom:1px solid var(--line)}.log tr{cursor:pointer}.log tr:hover{background:var(--card)}
+.raw{white-space:pre-wrap;word-break:break-all;color:var(--mute);padding:4px 0}
+.sub-tabs{display:flex;gap:6px;margin-bottom:12px}.sub-tabs button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+.mt td{padding:4px 4px}.mt input{width:100%}
 </style>
 <h1>witches</h1><div class=m id=sub>连接中…</div>
-<h2>GPT 账号（按使用顺序）</h2>
-<table><thead><tr><th>#<th>账号<th>5 小时剩余<th>7 天剩余<th>状态</thead><tbody id=rows></tbody></table>
-<div class=m id=gate></div>
-<h2>第三方余额</h2><div id=bal class=m>—</div>
+<div id=need class="m warn" style=display:none>没有面板令牌，只能看额度。在终端运行 <b>witches panel</b> 打开带令牌的地址，才能修改。</div>
+<nav id=tabs></nav>
+<section id=s-status></section><section id=s-accounts></section><section id=s-models></section><section id=s-config></section><section id=s-log></section>
+<div id=toast></div>
 <script>
+const $=s=>document.querySelector(s);
+const h=(tag,a,...k)=>{const e=document.createElement(tag);for(const[x,v]of Object.entries(a||{})){if(v==null||v===false)continue;if(x=='class')e.className=v;else if(x.startsWith('on'))e.addEventListener(x.slice(2),v);else e.setAttribute(x,v===true?'':v)}for(const c of k.flat())if(c!=null)e.append(c);return e};
+let T='';try{const m=location.hash.match(/token=([A-Za-z0-9_-]+)/);if(m){T=m[1];try{localStorage.setItem('wt',T)}catch(e){}history.replaceState(null,'',location.pathname)}else{try{T=localStorage.getItem('wt')||''}catch(e){}}}catch(e){}
 const t=s=>s==null?'':s>=86400?Math.floor(s/86400)+' 天 '+Math.floor(s%86400/3600)+' 小时':s>=3600?Math.floor(s/3600)+' 小时 '+Math.floor(s%3600/60)+' 分':s>=60?Math.floor(s/60)+' 分':s+' 秒';
-const cls=p=>p>=50?'ok':p>=20?'warn':'down';
-const cell=w=>w?'<span class='+cls(w.remaining_percent)+'>'+w.remaining_percent+'%</span> <span class=m>'+t(w.resets_in_s)+'后重置</span><div class=bar><i style="width:'+w.remaining_percent+'%;background:var(--'+(w.remaining_percent>=50?'ok':w.remaining_percent>=20?'warn':'down')+')"></i></div>':'<span class=m>—</span>';
-async function usage(){try{const u=await (await fetch('/api/usage')).json();
-rows.innerHTML=u.accounts.map((x,i)=>{const w=n=>(x.windows||[]).find(v=>v.name==n);
-return '<tr><td>'+(i+1)+'<td>'+x.account+'<div class=m>'+(x.plan||'')+'</div><td>'+cell(w('5h'))+'<td>'+cell(w('7d'))+'<td class='+(x.down_s||x.limit_reached?'down':x.error?'warn':'ok')+'>'+(x.down_s?'额度用完，'+t(x.down_s)+'后恢复':x.limit_reached?'额度用完':x.error?'查询失败：'+x.error:'可用')+'</tr>'}).join('');
-bal.innerHTML=u.providers.length?u.providers.map(p=>p.provider+'：'+(p.error?'查询失败 '+p.error:p.balances.map(b=>b.total+' '+b.currency).join(' / '))).join('<br>'):'没有支持余额查询的 provider（目前认 DeepSeek）'}catch(e){rows.innerHTML='<tr><td colspan=5 class=m>额度查询失败</tr>'}}
-async function tick(){try{const h=await (await fetch('/health')).json(),o=h.openai;
-sub.textContent='运行中 · pid '+h.pid+' · 额度每 30 秒、状态每 3 秒刷新';
-gate.textContent='GPT 并发 '+o.active+'/'+o.runtime_limit+'，排队 '+o.waiting}catch(e){sub.textContent='无法连接 witches'}}
-tick();usage();setInterval(tick,3000);setInterval(usage,30000)
+const col=p=>p>=50?'ok':p>=20?'warn':'down';
+let tt;const toast=(x,bad)=>{const e=$('#toast');e.textContent=x;e.style.display='block';e.style.background=bad?'var(--down)':'var(--fg)';clearTimeout(tt);tt=setTimeout(()=>e.style.display='none',3500)};
+async function api(method,path,body){const r=await fetch(path,{method,headers:{'X-Witches-Token':T,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});let d={};try{d=await r.json()}catch(e){}if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d}
+const usage=()=>fetch('/api/usage',{headers:{'X-Witches-Token':T}}).then(r=>r.json());
+const act=async(f,ok)=>{try{await f();if(ok)toast(ok)}catch(e){toast(e.message,1)}};
+const bar=w=>w?[h('span',{class:col(w.remaining_percent)},w.remaining_percent+'%'),' ',h('span',{class:'m'},t(w.resets_in_s)+'后重置'),h('div',{class:'bar'},h('i',{style:'width:'+w.remaining_percent+'%;background:var(--'+col(w.remaining_percent)+')'}))]:h('span',{class:'m'},'—');
+const tabs={status:'状态',accounts:'账号',models:'模型',config:'配置',log:'日志'};let cur='status',timer;
+for(const[k,v]of Object.entries(tabs))$('#tabs').append(h('button',{'data-t':k,onclick:()=>show(k)},v));
+function show(k){cur=k;clearInterval(timer);document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t==k));document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id=='s-'+k));({status:rStatus,accounts:rAccounts,models:rModels,config:rConfig,log:rLog})[k]();if(k=='status')timer=setInterval(rStatus,5000);if(k=='accounts')timer=setInterval(rAccounts,20000)}
+const put=(id,...k)=>{if(cur==id)$('#s-'+id).replaceChildren(...k.flat())};
+const sw=(on,label,fn)=>{const c=h('input',{type:'checkbox',checked:on?true:null,onchange:()=>fn(c.checked)});return h('label',{class:'sw'},c,label)};
+const w5=(r,n)=>(r.windows||[]).find(v=>v.name==n);
+
+async function rStatus(){try{const[st,u]=await Promise.all([api('GET','/api/state'),usage()]);$('#need').style.display='none';
+$('#sub').textContent='运行中 · pid '+st.pid+' · 已运行 '+t(st.uptime_s)+' · 端口 '+st.port;
+const up=h('div',{class:'m'},'点“检测”测试各上游');
+put('status',h('div',{class:'grid'},
+h('div',{class:'card wide'},h('h2',null,'GPT 账号额度（按使用顺序）'),usageTable(st.accounts,u.accounts)),
+h('div',{class:'card'},h('h2',null,'Codex 接入'),h('div',{class:st.codex.wired?'ok':'warn'},st.codex.wired?'已启用：Codex 的请求经过 witches':'已停用：Codex 直连 OpenAI，witches 不参与（第三方模型不可用）'),h('div',{class:'m'},st.codex.config+' 里的 openai_base_url 一行'),h('div',{class:'row'},h('button',{class:'b '+(st.codex.wired?'d':'p'),onclick:()=>(!st.codex.wired||confirm('停用 witches 接入？Codex 会直连 OpenAI，第三方模型和多账号轮换都不会生效'))&&act(async()=>{await api('POST','/api/codex',{on:!st.codex.wired});rStatus()},st.codex.wired?'已停用，已打开的线程需重启 app-server':'已启用，已打开的线程需重启 app-server')},st.codex.wired?'停用接入':'启用接入'))),
+h('div',{class:'card'},h('h2',null,'服务'),h('div',{class:'m'},st.managed?'由系统服务托管，退出后自动拉起':'前台运行，不能从这里重启'),h('div',{class:'m'},'GPT 并发 '+st.openai.max_concurrency+'，排队 '+st.openai.queue_timeout+' 秒，失败重试 '+st.openai.max_retries+' 次'),h('div',{class:'row'},h('button',{class:'b',onclick:()=>confirm('重启 witches？进行中的请求会中断')&&act(async()=>{await api('POST','/api/restart');toast('重启中…');setTimeout(()=>location.reload(),2500)})},'重启 witches'))),
+h('div',{class:'card'},h('h2',null,'第三方余额'),u.providers.length?u.providers.map(p=>h('div',null,p.provider+'：'+(p.error?'查询失败 '+p.error:p.balances.map(b=>b.total+' '+b.currency).join(' / ')))):h('div',{class:'m'},'没有支持余额查询的 provider（目前认 DeepSeek）')),
+h('div',{class:'card'},h('h2',null,'上游连通性'),h('div',{class:'row'},h('button',{class:'b',onclick:()=>act(async()=>{up.replaceChildren('检测中…');const d=await api('GET','/api/upstreams');up.replaceChildren(...d.upstreams.map(x=>h('div',{class:x.error||x.status>=400?'down':'ok'},x.provider+'：'+(x.error||('HTTP '+x.status+' · '+x.ms+' ms')))))})},'检测')),up)))}
+catch(e){$('#sub').textContent=T?'无法连接 witches':'只读模式';$('#need').style.display=T?'none':'block';if(!T){try{const u=await usage();put('status',h('div',{class:'card'},h('h2',null,'GPT 账号额度'),usageTable(u.accounts.map(a=>({label:a.account})),u.accounts)))}catch(x){}}else put('status',h('div',{class:'down'},e.message))}}
+function usageTable(accs,rows){return h('table',null,h('thead',null,h('tr',null,['#','账号','5 小时剩余','7 天剩余','状态'].map(x=>h('th',null,x)))),h('tbody',null,rows.map((r,i)=>{const a=accs[i]||{};return h('tr',{class:r.disabled?'off':null},h('td',null,i+1),h('td',null,a.label||r.account,h('div',{class:'m'},r.plan||a.plan||'')),h('td',null,bar(w5(r,'5h'))),h('td',null,bar(w5(r,'7d'))),h('td',{class:r.disabled?'m':r.down_s||r.limit_reached?'down':r.error?'warn':'ok'},r.disabled?'已停用':r.down_s?'额度用完，'+t(r.down_s)+'后恢复':r.limit_reached?'额度用完':r.error?'查询失败：'+r.error:'可用'))})))}
+
+async function rAccounts(){try{const[st,u]=await Promise.all([api('GET','/api/state'),usage()]);const refs=st.accounts.map(a=>a.ref);
+const move=(i,d)=>act(async()=>{const o=[...refs];[o[i],o[i+d]]=[o[i+d],o[i]];await api('PUT','/api/accounts',{order:o});rAccounts()});
+const name=h('input',{placeholder:'名称，例如 plus-3'}),auth=h('textarea',{placeholder:'粘贴这个账号的 auth.json 全部内容',style:'width:100%;min-height:120px;font:.8em ui-monospace,Menlo,monospace'});
+put('accounts',h('div',{class:'grid'},h('div',{class:'card wide'},h('div',{class:'m'},'按顺序使用：前一个的额度用完（5 小时窗口）才换下一个，恢复后自动回到靠前的账号。停用的账号保留在列表里，但不参与轮换。'),
+h('table',null,h('tbody',null,st.accounts.map((a,i)=>{const r=u.accounts[i]||{};return h('tr',{class:a.disabled?'off':null},h('td',null,i+1),h('td',null,a.label,' ',a.disabled?h('span',{class:'pill'},'已停用'):null,h('div',{class:'m'},(a.plan||'')+(a.codex_login?' · Codex 登录的账号':'')+' · '+a.ref)),h('td',{style:'min-width:150px'},bar(w5(r,'5h'))),h('td',{style:'white-space:nowrap'},sw(!a.disabled,'启用',on=>act(async()=>{await api('POST','/api/accounts/toggle',{ref:a.ref,disabled:!on});rAccounts()},on?'已启用':'已停用，不再参与轮换')),' ',h('button',{class:'b',onclick:()=>move(i,-1),disabled:i==0},'↑'),' ',h('button',{class:'b',onclick:()=>move(i,1),disabled:i==refs.length-1},'↓'),' ',a.codex_login?null:h('button',{class:'b d',onclick:()=>confirm('删除 '+a.label+'？会同时删掉它的 auth.json 文件')&&act(async()=>{await api('DELETE','/api/accounts',{ref:a.ref});rAccounts()},'已删除')},'删除')))})))),
+h('div',{class:'card wide'},h('h2',null,'添加账号'),h('div',{class:'m'},'先单独登录：CODEX_HOME=某个新目录 codex login，再把该目录下的 auth.json 粘贴到这里。不要复用别的工具正在用的登录，refresh token 会互相失效。'),h('div',{class:'row'},name),auth,h('div',{class:'row'},h('button',{class:'b p',onclick:()=>act(async()=>{await api('POST','/api/accounts',{name:name.value.trim(),auth:auth.value});rAccounts()},'已添加')},'添加')))))}catch(e){put('accounts',h('div',{class:'down'},e.message))}}
+
+async function rModels(){try{const st=await api('GET','/api/state');
+put('models',h('div',{class:'grid'},h('div',{class:'card wide'},h('table',null,h('thead',null,h('tr',null,['模型','上下文','看图','推理档位','备选',''].map(x=>h('th',null,x)))),h('tbody',null,st.models.map(m=>{const r=h('span',{class:'m'});return h('tr',null,h('td',null,m.slug),h('td',null,m.context?Math.round(m.context/1000)+'k':''),h('td',null,m.images?'是':''),h('td',{class:'m'},m.efforts.join(' ')),h('td',{class:'m'},m.fallback.join(' ')),h('td',null,h('button',{class:'b',onclick:()=>act(async()=>{r.className='m';r.textContent='测试中…';const d=await api('POST','/api/test',{model:m.slug});r.className=d.ok?'ok':'down';r.textContent=d.ok?'正常 '+d.ms+' ms':'失败 '+(d.error||d.status)})},'测试'),' ',r))})))),
+h('div',{class:'card'},h('h2',null,'看图代理'),h('div',{class:'m'},st.vision.length?[].concat(st.vision).join(' → '):'未配置')),h('div',{class:'card'},h('h2',null,'子代理改派'),h('div',{class:'m'},Object.keys(st.route).length?Object.entries(st.route).map(([k,v])=>k+' → '+v).join('，'):'未配置')),h('div',{class:'card'},h('h2',null,'切换提示'),h('div',{class:'m'},st.switch_note?'开':'关')),h('div',{class:'card wide m'},'这些都在“配置”页的表单里修改。')))}catch(e){put('models',h('div',{class:'down'},e.message))}}
+
+/* ---- 配置：表单 + TOML 源码 ---- */
+let cfgMode='form';
+async function rConfig(){try{const d=await api('GET','/api/config');const data=d.data;data.providers=data.providers||{};data.openai=data.openai||{};data.route=data.route||{};
+const bind=(o,k,opt={})=>{const e=h('input',{type:opt.num?'number':'text',placeholder:opt.ph||''});e.value=o[k]==null?'':(opt.list&&Array.isArray(o[k])?o[k].join(', '):o[k]);e.oninput=()=>{const v=e.value.trim();if(v==='')delete o[k];else o[k]=opt.num?Number(v):opt.list?v.split(',').map(x=>x.trim()).filter(Boolean):v};return e};
+const fld=(label,el,hint)=>[h('label',null,label),h('div',null,el,hint?h('div',{class:'m'},hint):null)];
+const slugs=[];for(const[pn,p]of Object.entries(data.providers))for(const mid of Object.keys(p.models||{}))slugs.push(pn+'/'+mid);
+const dl=h('datalist',{id:'slugs'},slugs.map(s=>h('option',{value:s})));
+const provCard=(pn,p)=>{p.models=p.models||{};return h('div',{class:'card wide'},h('div',{class:'row'},h('b',null,pn),h('button',{class:'b d right',onclick:()=>confirm('删除 provider '+pn+' 及其所有模型？（保存后才生效）')&&(delete data.providers[pn],draw())},'删除')),
+h('div',{class:'f'},fld('base_url',bind(p,'base_url',{ph:'https://…/v1'})),fld('api_key',bind(p,'api_key'),'显示成 ••••xxxx#hash 表示已保存；换 key 直接整段替换'),fld('max_concurrency',bind(p,'max_concurrency',{num:1}),'同时请求上限，0 不限')),
+h('table',{class:'mt'},h('thead',null,h('tr',null,['模型 id','上下文','看图','推理档位（逗号分隔，空=默认）','备选模型（逗号分隔）',''].map(x=>h('th',null,x)))),h('tbody',null,Object.entries(p.models).map(([mid,m])=>{const eff=m.efforts&&!Array.isArray(m.efforts);return h('tr',null,h('td',null,h('b',{class:'m'},mid)),h('td',null,bind(m,'context',{num:1})),h('td',null,sw(m.images,'',v=>{if(v)m.images=true;else delete m.images})),h('td',null,eff?h('span',{class:'m'},'自定义映射表，用 TOML 源码修改'):bind(m,'efforts',{list:1,ph:'low, high, max'})),h('td',null,bind(m,'fallback',{list:1,ph:'Provider/model'})),h('td',null,h('button',{class:'b d',onclick:()=>(delete p.models[mid],draw())},'×')))}))),
+(()=>{const n=h('input',{placeholder:'新模型 id（上游模型名）'});return h('div',{class:'row'},n,h('button',{class:'b',onclick:()=>{const v=n.value.trim();if(!v)return;p.models[v]={};draw()}},'+ 添加模型'))})())};
+const routeRows=()=>[...Object.entries(data.route).map(([k,v])=>h('div',{class:'row'},h('b',{style:'min-width:170px'},k),h('input',{list:'slugs',value:v,oninput:e=>data.route[k]=e.target.value,class:'grow'}),h('button',{class:'b d',onclick:()=>(delete data.route[k],draw())},'×'))),(()=>{const s=h('select',null,['collab_spawn','guardian','review','memory_consolidation'].filter(x=>!(x in data.route)).map(x=>h('option',null,x)));return h('div',{class:'row'},s,h('button',{class:'b',onclick:()=>{if(s.value){data.route[s.value]='';draw()}}},'+ 添加改派'))})()];
+const visionIn=bind(data,'vision',{list:1,ph:'Provider/model, …'});visionIn.setAttribute('list','slugs');
+const save=()=>act(async()=>{if(!Object.keys(data.route).length)delete data.route;await api('PUT','/api/config',cfgMode=='form'?{data}:{text:src.value});rConfig()},'已保存，对新请求立即生效');
+const src=h('textarea',{class:'src',spellcheck:'false'});src.value=d.text;
+const addProv=(()=>{const n=h('input',{placeholder:'新 provider 名称，例如 Zhipu'});return h('div',{class:'row'},n,h('button',{class:'b',onclick:()=>{const v=n.value.trim();if(!v||data.providers[v])return;data.providers[v]={base_url:'',api_key:'',models:{}};draw()}},'+ 添加 provider'))})();
+function draw(){put('config',dl,h('div',{class:'row'},h('div',{class:'sub-tabs'},h('button',{class:'b '+(cfgMode=='form'?'on':''),onclick:()=>{cfgMode='form';draw()}},'表单'),h('button',{class:'b '+(cfgMode=='src'?'on':''),onclick:()=>{cfgMode='src';draw()}},'TOML 源码')),h('span',{class:'m'},'即 ~/.witches/config.toml；保存前校验并留一份 config.toml.bak；对新请求立即生效（改端口需重启）'),h('span',{class:'right row'},h('button',{class:'b',onclick:rConfig},'放弃修改'),h('button',{class:'b p',onclick:save},'保存'))),
+cfgMode=='src'?[h('div',{class:'m'},'源码模式保留注释；表单模式保存时会重新生成文件，注释不保留。'),src]:
+h('div',{class:'grid'},
+h('div',{class:'card'},h('h2',null,'基础'),h('div',{class:'f'},fld('端口',bind(data,'port',{num:1}),'改了要重启'),fld('看图代理 vision',visionIn,'纯文本模型收到图片时，先交给它转写'),fld('切换提示',sw(data.switch_note!==false,'线程里换模型后提示一行',v=>{if(v)delete data.switch_note;else data.switch_note=false})))),
+h('div',{class:'card'},h('h2',null,'GPT 通道'),h('div',{class:'f'},fld('max_concurrency',bind(data.openai,'max_concurrency',{num:1}),'同时请求数，0 不限'),fld('queue_timeout',bind(data.openai,'queue_timeout',{num:1}),'排队最多等几秒'),fld('max_retries',bind(data.openai,'max_retries',{num:1}),'首次输出前最多重试几次'),fld('retry_window',bind(data.openai,'retry_window',{num:1}),'安排重试的时间窗口（秒）')),h('div',{class:'m'},'账号顺序和启停在“账号”页。')),
+h('div',{class:'card wide'},h('h2',null,'子代理 / 审查改派（原本发给 GPT 的请求改给第三方模型）'),routeRows()),
+Object.entries(data.providers).map(([pn,p])=>provCard(pn,p)),h('div',{class:'card wide'},addProv)))}
+draw()}catch(e){put('config',h('div',{class:'down'},e.message))}}
+
+/* ---- 日志：解析成表格，可筛选、搜索、自动刷新 ---- */
+let logSt={f:'all',q:'',auto:true,n:300};
+function parseLog(l){const m=l.match(/^([0-9][0-9]-[0-9][0-9] [0-9:]{8}) (?:(?:GET|POST|PUT|DELETE|PATCH) ([^ ]+) )?(.*)$/);if(!m)return{raw:l,kind:'other',time:'',sum:l,lvl:'',el:'',st:''};
+const rest=m[3];const o={raw:l,time:m[1],kind:'other',sum:rest,lvl:'',el:'',st:''};const g=rest.match(/^(.*?) -> openai ({.*})$/);
+if(g){o.kind='gpt';try{const j=JSON.parse(g[2]);o.sum=g[1]+' · '+j.account+(j.attempt>1?' · 第'+j.attempt+'次尝试':'')+(j.code?' · '+j.code:'')+(j.retry_in?' · '+j.retry_in+'s 后重试':'')+(j.retry_stop?' · '+j.retry_stop:'');o.el=j.elapsed!=null?j.elapsed+'s':'';o.st=(j.http||'—')+' '+j.outcome;o.lvl=j.outcome=='ok'?'ok':j.outcome=='client_disconnect'?'warn':'down'}catch(e){}return o}
+const p=rest.match(/^([^ ]+[/][^ ]+) ([a-z_]+) ([0-9.]+)s(.*)$/);if(p){o.kind='3p';o.sum=p[1]+p[4];o.el=p[3]+'s';o.st=p[2];o.lvl=p[2]=='ok'?'ok':'down';return o}
+if(/error|fail|exception|timeout|disconnect|502|429/i.test(rest))o.lvl='down';return o}
+async function rLog(){try{const d=await api('GET','/api/log?n='+logSt.n);const rows=d.lines.map(parseLog);
+const q=logSt.q.toLowerCase();const shown=rows.filter(r=>(logSt.f=='all'||(logSt.f=='err'?r.lvl=='down':r.kind==logSt.f))&&(!q||r.raw.toLowerCase().includes(q)));
+const tb=h('tbody',null,shown.reverse().map(r=>{const raw=h('tr',{style:'display:none'},h('td',{colspan:5},h('div',{class:'raw'},r.raw)));return[h('tr',{onclick:()=>raw.style.display=raw.style.display=='none'?'':'none'},h('td',{class:'m',style:'white-space:nowrap'},r.time),h('td',null,r.kind=='gpt'?'GPT':r.kind=='3p'?'第三方':''),h('td',{style:'word-break:break-all'},r.sum),h('td',{class:'m'},r.el),h('td',{class:r.lvl},r.st)),raw]}).flat());
+const had=document.activeElement&&document.activeElement.dataset&&document.activeElement.dataset.q;const q2=h('input',{'data-q':'1',placeholder:'搜索（模型、账号、错误码…）',value:logSt.q,class:'grow',oninput:e=>{logSt.q=e.target.value;clearTimeout(q2._t);q2._t=setTimeout(rLog,250)}});
+put('log',h('div',{class:'row'},h('select',{onchange:e=>{logSt.f=e.target.value;rLog()}},[['all','全部'],['gpt','GPT'],['3p','第三方'],['err','出错']].map(([v,l])=>h('option',{value:v,selected:logSt.f==v?true:null},l))),q2,h('select',{onchange:e=>{logSt.n=+e.target.value;rLog()}},[200,300,600,1000].map(n=>h('option',{value:n,selected:logSt.n==n?true:null},'最近 '+n+' 行'))),sw(logSt.auto,'自动刷新',v=>{logSt.auto=v;rLog()}),h('button',{class:'b',onclick:rLog},'刷新'),h('span',{class:'m'},'显示 '+shown.length+' / '+rows.length+' 条，新的在上；点一行看原文；不含对话内容')),
+h('table',{class:'log'},h('thead',null,h('tr',null,['时间','类型','内容','耗时','结果'].map(x=>h('th',null,x)))),tb));
+if(had&&cur=='log'){q2.focus();q2.setSelectionRange(q2.value.length,q2.value.length)}clearInterval(timer);if(logSt.auto&&cur=='log')timer=setInterval(()=>{if(!document.activeElement||document.activeElement.tagName!='INPUT')rLog()},3000)}catch(e){put('log',h('div',{class:'down'},e.message))}}
+if(!T){$('#need').style.display='block'}show('status')
 </script>"""
 
 # Codex 自己的压缩提示词与摘要前缀（openai/codex，Apache-2.0）
@@ -486,10 +583,10 @@ def account_usage(acct, fresh=False):
         hit = _usage_cache.get(acct)
         if hit and not fresh and time.monotonic() - hit[0] < 60:
             return hit[1]
-    out = {'account': 'primary' if acct is None else acct.stem}
+    out = {'account': account_name(acct)}
     try:
         if acct is None:
-            t = json.loads((CODEX_HOME / 'auth.json').read_text())['tokens']
+            t = json.loads(codex_auth().read_text())['tokens']
             h = {'Authorization': f"Bearer {t['access_token']}", 'chatgpt-account-id': t.get('account_id', '')}
         else:
             h = account_headers(acct)
@@ -521,9 +618,11 @@ def provider_balance(name, p):
         return {'provider': name, 'error': str(e) or type(e).__name__}
 
 
-def usage_report(fresh=False):
+def usage_report(fresh=False, labels=False):
     cfg = config()
-    pool = account_pool(openai_options(cfg))
+    opts = openai_options(cfg)
+    pool = account_pool(opts, every=True)
+    live = account_pool(opts)
     now = time.monotonic()
     with ThreadPoolExecutor(max_workers=8) as ex:
         accounts = list(ex.map(lambda a: account_usage(a, fresh), pool))
@@ -532,15 +631,58 @@ def usage_report(fresh=False):
     with _down_lock:
         for a, row in zip(pool, accounts):
             row['down_s'] = round(max(0, _down.get(a, 0) - now))
+            row['disabled'] = a not in live
+    if labels:  # 邮箱只给带面板令牌的请求
+        accounts = [{**row, 'label': account_label(a)} for a, row in zip(pool, accounts)]
     return {'accounts': accounts, 'providers': balances}
 
 
-def account_pool(opts):
-    """账号顺序：accounts 里的 "primary" 代表 Codex 自己的登录态，可放在任意位置；没写就排第一。"""
-    names = list(opts.get('accounts') or [])
-    if 'primary' not in names:
-        names.insert(0, 'primary')
-    return [None if n == 'primary' else Path(n).expanduser() for n in names]
+CODEX_LOGIN = 'codex-login'  # 没有邮箱可显示时（匿名接口、日志）Codex 自己登录态的名字
+_started = time.time()
+
+
+def codex_auth():
+    return CODEX_HOME / 'auth.json'
+
+
+def _acct(n):
+    p = Path(n).expanduser()
+    return None if n == 'primary' or p.resolve() == codex_auth().resolve() else p
+
+
+def account_pool(opts, every=False):
+    """账号顺序：accounts 是 auth.json 路径列表，Codex 自己的登录态就是 ~/.codex/auth.json（旧写法 "primary" 也认）；
+    列表里没有它就排第一。轮到它时请求头原样透传，None 代表它。disabled 里的账号保留在列表但不参与轮换
+    （every=True 时连同停用的一起返回）。全部停用时 choose() 仍退回 Codex 自己的登录态。"""
+    pool = [_acct(n) for n in opts.get('accounts') or []]
+    if None not in pool:
+        pool.insert(0, None)
+    if every:
+        return pool
+    off = {a.resolve() if a else None for a in map(_acct, opts.get('disabled') or [])}
+    return [a for a in pool if (a.resolve() if a else None) not in off]
+
+
+def account_name(acct):
+    return CODEX_LOGIN if acct is None else acct.stem
+
+
+def claims(path):
+    """auth.json 里 access_token 的 JWT 声明（只读本地，不验签）；坏文件返回空。"""
+    try:
+        p = json.loads(Path(path).read_text())['tokens']['access_token'].split('.')[1]
+        return json.loads(base64.urlsafe_b64decode(p + '=' * (-len(p) % 4)))
+    except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return {}
+
+
+def account_label(acct):
+    c = claims(codex_auth() if acct is None else acct)
+    return (c.get('https://api.openai.com/profile') or {}).get('email') or account_name(acct)
+
+
+def account_plan(acct):
+    return (claims(codex_auth() if acct is None else acct).get('https://api.openai.com/auth') or {}).get('chatgpt_plan_type')
 
 
 def choose(pool, h):
@@ -570,7 +712,7 @@ def health():
     if opts.get('accounts'):
         now = time.monotonic()
         with _down_lock:
-            out['accounts'] = [{'account': 'primary' if a is None else a.stem, 'down_s': round(max(0, _down.get(a, 0) - now))}
+            out['accounts'] = [{'account': account_name(a), 'down_s': round(max(0, _down.get(a, 0) - now))}
                                for a in account_pool(opts)]
     return {'ok': True, 'pid': os.getpid(), 'openai': out}
 
@@ -1226,6 +1368,239 @@ def log(msg):
     print(time.strftime('%m-%d %H:%M:%S'), msg, file=sys.stderr, flush=True)
 
 
+# ---------------------------------------------------------------- 面板 API（读写配置，需要面板令牌）
+
+def panel_token():
+    """面板令牌：~/.witches/panel.token（0600）。`witches panel` 会打开带令牌的地址；别人读不到这个文件就进不了写接口。"""
+    f = HOME / 'panel.token'
+    try:
+        return f.read_text().strip()
+    except OSError:
+        HOME.mkdir(parents=True, exist_ok=True)
+        tok = secrets.token_urlsafe(24)
+        fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as fh:
+            fh.write(tok)
+        return tok
+
+
+SECRET_KEY = re.compile(r'key|token|secret|password', re.I)
+
+
+def secret_values(node):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, str) and v and SECRET_KEY.search(k):
+                yield v
+            else:
+                yield from secret_values(v)
+
+
+def mask(secret):
+    return f'••••{secret[-4:]}#{hashlib.sha1(secret.encode()).hexdigest()[:6]}'
+
+
+def masked_config(text):
+    for sec in sorted(set(secret_values(config())), key=len, reverse=True):
+        text = text.replace(f'"{sec}"', f'"{mask(sec)}"')
+    return text
+
+
+def unmask_config(text):
+    table = {mask(sec).rsplit('#', 1)[1]: sec for sec in secret_values(config())}
+
+    def back(m):
+        if m[1] not in table:
+            raise ValueError('配置里有认不出的隐藏密钥（••••xxxx#hash），请重新填写完整的 key')
+        return table[m[1]]
+    return re.sub(r'••••[^"#\n]{0,8}#([0-9a-f]{6})', back, text)
+
+
+BARE = re.compile(r'[A-Za-z0-9_-]+$')
+
+
+def tkey(k):
+    return k if BARE.match(k) else json.dumps(k, ensure_ascii=False)
+
+
+def tval(v):
+    if isinstance(v, bool):
+        return 'true' if v else 'false'
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, list):
+        return '[' + ', '.join(map(tval, v)) + ']'
+    if isinstance(v, dict):
+        return '{ ' + ', '.join(f'{tkey(k)} = {tval(x)}' for k, x in v.items()) + ' }' if v else '{}'
+    raise ValueError(f'不支持的配置值：{v!r}')
+
+
+def toml_dumps(d, path=()):
+    """我们配置的最小 TOML 写出：前三层是 [表]（providers.X.models），更深的是内联表。注释不保留。"""
+    lines, tables = [], []
+    for k, v in d.items():
+        (tables if isinstance(v, dict) and len(path) + 1 <= 3 else lines).append((k, v))
+    out = [f'{tkey(k)} = {tval(v)}' for k, v in lines]
+    text = '\n'.join(out) + ('\n' if out else '')
+    if path and not out:
+        text = ''
+    parts = [f"[{'.'.join(map(tkey, path))}]\n" + text] if path and out else [text] if out else []
+    for k, v in tables:
+        parts.append(toml_dumps(v, path + (k,)))
+    return '\n'.join(p for p in parts if p)
+
+
+def mask_data(node):
+    if isinstance(node, dict):
+        return {k: mask(v) if isinstance(v, str) and v and SECRET_KEY.search(k) else mask_data(v) for k, v in node.items()}
+    return [mask_data(x) for x in node] if isinstance(node, list) else node
+
+
+def unmask_data(node):
+    if isinstance(node, dict):
+        return {k: unmask_data(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [unmask_data(x) for x in node]
+    return unmask_config(node) if isinstance(node, str) else node
+
+
+def dump_checked(data):
+    text = toml_dumps(data)
+    if tomllib.loads(text) != data:
+        raise ValueError('这份配置无法无损写成 TOML，请用“TOML 源码”页修改')
+    return text
+
+
+def write_config(text):
+    """校验 TOML、留一份 config.toml.bak、原子写入（0600）。配置每个请求都会重新读，保存即生效（port 除外）。"""
+    tomllib.loads(text)
+    f = HOME / 'config.toml'
+    if f.exists():
+        shutil.copy2(f, f.with_name('config.toml.bak'))
+    tmp = f.with_name('config.toml.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as fh:
+        fh.write(text)
+    os.replace(tmp, f)
+
+
+def ref(p):
+    """账号在配置里的写法：家目录下用 ~/ 开头。"""
+    p = Path(p)
+    try:
+        return '~/' + str(p.resolve().relative_to(Path.home().resolve()))
+    except ValueError:
+        return str(p)
+
+
+def account_refs():
+    return [ref(codex_auth() if a is None else a) for a in account_pool(config().get('openai', {}), every=True)]
+
+
+def set_openai_list(key, refs):
+    text = (HOME / 'config.toml').read_text() if (HOME / 'config.toml').exists() else ''
+    line = f'{key} = ' + json.dumps(refs, ensure_ascii=False)
+    pat = re.compile(rf'^{key}\s*=\s*\[[^\]]*\]', re.M)
+    head = re.compile(r'^\[openai\][ \t]*$', re.M)
+    if pat.search(text):
+        text = pat.sub(lambda m: line, text, count=1)
+    elif head.search(text):
+        text = head.sub(lambda m: m[0] + '\n' + line, text, count=1)
+    else:
+        text = text.rstrip('\n') + '\n\n[openai]\n' + line + '\n'
+    write_config(text)
+
+
+def set_accounts(refs):
+    set_openai_list('accounts', refs)
+
+
+def disabled_refs():
+    return [ref(codex_auth() if a is None else a) for a in map(_acct, config().get('openai', {}).get('disabled') or [])]
+
+
+def toggle_account(r, disabled):
+    if r not in account_refs():
+        raise KeyError('没有这个账号')
+    off = [x for x in disabled_refs() if x != r] + ([r] if disabled else [])
+    set_openai_list('disabled', off)
+
+
+def import_account(name, auth):
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,40}', name or ''):
+        raise ValueError('名称只能用字母、数字、点、下划线和短横线（最多 40 个字符）')
+    auth = json.loads(auth) if isinstance(auth, str) else auth
+    t = auth['tokens']
+    if not (t.get('access_token') and t.get('refresh_token')):
+        raise ValueError('auth.json 里需要 tokens.access_token 和 tokens.refresh_token')
+    f = HOME / 'accounts' / f'{name}.json'
+    if f.exists():
+        raise FileExistsError(f'已经有叫 {name} 的账号')
+    f.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w') as fh:
+        json.dump(auth, fh, indent=2)
+    set_accounts(account_refs() + [ref(f)])
+    return f
+
+
+def remove_account(r):
+    refs = account_refs()
+    if r not in refs:
+        raise KeyError('没有这个账号')
+    p = Path(r).expanduser()
+    if p.resolve() == codex_auth().resolve():
+        raise ValueError('Codex 自己的登录态不能删除，只能调整顺序')
+    set_accounts([x for x in refs if x != r])
+    if r in disabled_refs():
+        set_openai_list('disabled', [x for x in disabled_refs() if x != r])
+    if p.resolve().parent == (HOME / 'accounts').resolve():
+        p.unlink(missing_ok=True)
+
+
+def model_rows(cfg):
+    return [{'slug': f'{pn}/{mid}', 'provider': pn, 'context': m.get('context'), 'images': bool(m.get('images')),
+             'efforts': list(levels({'upstream': mid, **m})), 'fallback': m.get('fallback', [])}
+            for pn, p in cfg.get('providers', {}).items() for mid, m in p.get('models', {}).items()]
+
+
+def upstream_rows(cfg):
+    def ping(kv):
+        name, p = kv
+        t0 = time.monotonic()
+        try:
+            with fetch('GET', p['base_url'].rstrip('/') + '/models', None,
+                       {'Authorization': f"Bearer {p.get('api_key', '')}"}, timeout=8) as r:
+                r.read()
+                return {'provider': name, 'status': r.status, 'ms': round((time.monotonic() - t0) * 1000)}
+        except (OSError, http.client.HTTPException) as e:
+            return {'provider': name, 'error': str(e) or type(e).__name__}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(ping, cfg.get('providers', {}).items()))
+
+
+def codex_wired():
+    f = CODEX_HOME / 'config.toml'
+    return f.exists() and any(MARK in ln for ln in f.read_text().splitlines())
+
+
+def tail_log(n):
+    n = max(1, min(n, 1000))
+    try:
+        with open(HOME / 'witches.log', 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 262144))
+            return f.read().decode(errors='replace').splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def managed():
+    return os.getppid() == 1 or 'INVOCATION_ID' in os.environ  # launchd / systemd 拉起的，退出后会被重启
+
+
 # ---------------------------------------------------------------- HTTP 服务
 
 class Handler(BaseHTTPRequestHandler):
@@ -1301,6 +1676,102 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- 路由
 
+    def api(self, raw):
+        port = self.server.server_port
+        hosts = {f'{h}:{port}' for h in ('127.0.0.1', 'localhost', '[::1]')}
+        origin = self.headers.get('Origin')
+        if self.headers.get('Host') not in hosts or origin and origin not in {f'http://{h}' for h in hosts}:
+            return self.send_json(403, {'error': 'bad host/origin'})  # 防 DNS rebinding / 跨站
+        path, _, query = self.path.partition('?')
+        authed = hmac.compare_digest(self.headers.get('X-Witches-Token', ''), panel_token())
+        if path == '/api/usage' and self.command == 'GET':
+            return self.send_json(200, usage_report(fresh='refresh=1' in query, labels=authed))
+        if not authed:
+            return self.send_json(401, {'error': '需要面板令牌：在终端运行 witches panel 打开面板'})
+        try:
+            body = json.loads(raw) if raw else {}
+            cfg = config()
+            key = (self.command, path)
+            if key == ('GET', '/api/state'):
+                pool = account_pool(cfg.get('openai', {}), every=True)
+                off = set(disabled_refs())
+                with _down_lock:
+                    now = time.monotonic()
+                    down = [round(max(0, _down.get(a, 0) - now)) for a in pool]
+                return self.send_json(200, {
+                    'pid': os.getpid(), 'uptime_s': round(time.time() - _started), 'port': port, 'managed': managed(),
+                    'codex': {'wired': codex_wired(), 'config': str(CODEX_HOME / 'config.toml')},
+                    'accounts': [{'ref': r, 'label': account_label(a), 'plan': account_plan(a), 'codex_login': a is None,
+                                  'disabled': r in off, 'down_s': d} for r, a, d in zip(account_refs(), pool, down)],
+                    'models': model_rows(cfg), 'vision': cfg.get('vision', []), 'route': cfg.get('route', {}),
+                    'switch_note': cfg.get('switch_note', True),
+                    'openai': {k: openai_options(cfg)[k] for k in OPENAI_DEFAULTS}})
+            if key == ('GET', '/api/upstreams'):
+                return self.send_json(200, {'upstreams': upstream_rows(cfg)})
+            if key == ('GET', '/api/config'):
+                f = HOME / 'config.toml'
+                return self.send_json(200, {'text': masked_config(f.read_text() if f.exists() else ''), 'data': mask_data(cfg)})
+            if key == ('PUT', '/api/config'):
+                write_config(unmask_config(body['text']) if 'text' in body else dump_checked(unmask_data(body['data'])))
+                return self.send_json(200, {'ok': True})
+            if key == ('POST', '/api/accounts/toggle'):
+                toggle_account(body['ref'], bool(body['disabled']))
+                return self.send_json(200, {'ok': True})
+            if key == ('POST', '/api/accounts'):
+                f = import_account(body.get('name'), body.get('auth'))
+                return self.send_json(200, {'ok': True, 'ref': ref(f)})
+            if key == ('PUT', '/api/accounts'):
+                order = body['order']
+                if sorted(order) != sorted(account_refs()):
+                    raise ValueError('账号列表和当前不一致，刷新后再调整')
+                set_accounts(order)
+                return self.send_json(200, {'ok': True})
+            if key == ('DELETE', '/api/accounts'):
+                remove_account(body['ref'])
+                return self.send_json(200, {'ok': True})
+            if key == ('POST', '/api/test'):
+                return self.send_json(200, self.test_model(body['model'], port, cfg))
+            if key == ('GET', '/api/log'):
+                n = next((int(v) for k, _, v in (q.partition('=') for q in query.split('&')) if k == 'n' and v.isdigit()), 200)
+                return self.send_json(200, {'lines': tail_log(n)})
+            if key == ('POST', '/api/codex'):
+                try:
+                    edit_codex(port if body.get('on') else None)
+                except SystemExit as e:
+                    raise ValueError(str(e.code))
+                return self.send_json(200, {'ok': True, 'wired': codex_wired()})
+            if key == ('POST', '/api/restart'):
+                if not managed():
+                    return self.send_json(409, {'error': '不是由 launchd/systemd 拉起的，自己退出后不会重启；请用 witches install 常驻'})
+                threading.Timer(0.5, os._exit, [0]).start()
+                return self.send_json(200, {'ok': True})
+            return self.send_json(404, {'error': 'unknown api'})
+        except (ValueError, KeyError, TypeError, AttributeError) as e:  # TOMLDecodeError / JSONDecodeError 都是 ValueError
+            return self.send_json(400, {'error': f'{type(e).__name__}: {e}'})
+        except FileExistsError as e:
+            return self.send_json(409, {'error': str(e)})
+
+    def test_model(self, slug, port, cfg):
+        """给第三方模型发一个极小请求（用本机 Codex 登录令牌，和 Codex 自己走同一条路）；GPT 不在这里测，免得花额度。"""
+        if '/' not in slug or not lookup(cfg, slug):
+            raise ValueError('只能测试配置里的第三方模型')
+        h = {'Content-Type': 'application/json'}
+        try:
+            h['Authorization'] = 'Bearer ' + json.loads(codex_auth().read_text())['tokens']['access_token']
+        except (OSError, ValueError, KeyError):
+            pass
+        body = json.dumps({'model': slug, 'stream': True, 'instructions': 'Reply with: ok',
+                           'input': [{'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'say ok'}]}]}).encode()
+        t0 = time.monotonic()
+        try:
+            with fetch('POST', f'http://127.0.0.1:{port}/backend-api/codex/responses', body, h, timeout=60) as r:
+                data = r.read()
+                ok = r.status == 200 and b'response.completed' in data
+                return {'ok': ok, 'status': r.status, 'ms': round((time.monotonic() - t0) * 1000),
+                        **({} if ok else {'error': data[:200].decode(errors='replace')})}
+        except (OSError, http.client.HTTPException) as e:
+            return {'ok': False, 'error': str(e) or type(e).__name__}
+
     def route(self):
         self.response_started = False
         t0 = time.time()
@@ -1309,8 +1780,8 @@ class Handler(BaseHTTPRequestHandler):
         prefix = next((p for p in OPENAI if self.path.startswith(p + '/') or self.path == p), None)
         if self.path == '/health':
             return self.send_json(200, health())
-        if self.path.split('?')[0] == '/api/usage':  # 只读额度，不含邮箱和令牌
-            return self.send_json(200, usage_report(fresh='refresh=1' in self.path))
+        if self.path.startswith('/api/'):
+            return self.api(raw)
         if self.path in ('/', '/panel'):
             return self.send_bytes(200, PANEL.encode(), 'text/html; charset=utf-8')
         if self.headers.get('Upgrade', '').lower() == 'websocket':  # 426 让 Codex 立刻退回 HTTP
@@ -1372,7 +1843,7 @@ class Handler(BaseHTTPRequestHandler):
                 return None
             return wait
 
-        for attempt in range(retries + len(pool)):
+        for attempt in range(retries + max(1, len(pool))):
             acct, hh = choose(pool, h)
             r, pending, committed, wait = None, bytearray(), False, None
             probe, outcome = StreamProbe(), 'ok'
@@ -1501,7 +1972,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif probe.terminal_kind == 'response.incomplete' and outcome == 'ok':
                     outcome = 'incomplete'
                 fields = {'http': r.status if r else None, 'outcome': outcome, 'attempt': attempt + 1,
-                          'account': 'primary' if acct is None else acct.stem,
+                          'account': account_name(acct),
                           'committed': committed, 'request_id': request_id,
                           'chain_id': chain_id, 'stage': stage, 'error_class': error_class,
                           'terminal': probe.terminal_kind, 'delivered_bytes': delivered,
@@ -1958,11 +2429,18 @@ def main():
         uninstall()
     elif cmd == 'status':
         status()
+    elif cmd == 'panel':
+        url = f'http://127.0.0.1:{port}/panel#token={panel_token()}'
+        print(url)
+        try:
+            subprocess.run(['open' if sys.platform == 'darwin' else 'xdg-open', url], check=False)
+        except OSError:
+            pass  # 没有浏览器（远程服务器）：把地址复制出去用
     elif cmd == 'deploy' and len(args) > 1:
         deploy(args[1])
     else:
         print(__doc__)
-        print('用法: witches serve|install|uninstall|status [--port N] | deploy <ssh-host>')
+        print('用法: witches serve|install|uninstall|status|panel [--port N] | deploy <ssh-host>')
 
 
 if __name__ == '__main__':

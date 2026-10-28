@@ -133,16 +133,24 @@ GPT 日志中的 `chain_id` 关联同一请求的全部尝试，`request_id` 是
 
 **多账户（可选）**：`[openai] accounts = ["~/.witches/accounts/b.json"]`，每个是单独 `CODEX_HOME=… codex login` 得到的 auth.json。Codex 自己的登录态用 `"primary"` 表示，不写就排第一，可以放在列表任意位置（例如 `["plus.json", "primary"]` 是先用 Plus、最后才用 Codex 登录的账号）；轮到 primary 时请求头原样透传。当前账号报 `usage_limit_reached`（HTTP 429 或流内 `response.failed`）且还没有任何输出时，witches 换掉 `Authorization` / `chatgpt-account-id` 并去掉 `x-codex-turn-state`，用下一个账户重放，换号不占 `max_retries`。用完的账户按上游给的 `resets_in_seconds` 记下恢复时间（没有就 10 分钟），期间新请求直接走还有额度的账户；全部用完则把主账号的原始错误交给 Codex。access token 过期前会自动用 refresh token 续并写回该文件；`/health` 的 `openai.accounts` 显示各账户还要多久恢复。
 
-**状态面板与额度 API**：浏览器打开 `http://127.0.0.1:<port>/panel`，按使用顺序列出各 GPT 账号的 5 小时 / 7 天剩余额度、重置倒计时、是否被标记用完，以及 DeepSeek 余额。同一份数据的 JSON 接口：
+**管理面板**：终端运行 `witches panel` 会打开 `http://127.0.0.1:<port>/panel#token=…`（令牌在 `~/.witches/panel.token`，0600；没有令牌只能看额度）。五个页签：
+
+- **状态**：各 GPT 账号（显示登录邮箱）的 5 小时 / 7 天剩余额度和重置倒计时、DeepSeek 余额、上游连通性检测、Codex 接入的启用/停用、重启 witches。
+- **账号**：调整使用顺序、启用/停用某个账号（停用的保留在列表里但不参与轮换，配置里是 `[openai] disabled = [...]`）、粘贴 auth.json 添加账号、删除。
+- **模型**：列出所有第三方模型，一键测试能不能通。
+- **配置**：表单（端口、vision、GPT 通道、子代理改派、provider 和模型）和 TOML 源码两种方式；api_key 显示成 `••••xxxx#hash`，不改就不会动；保存前校验并留 `config.toml.bak`。表单保存会重新生成文件（不保留注释），要保留注释请用源码模式。
+- **日志**：把日志解析成表格，可按 GPT / 第三方 / 出错筛选、搜索、自动刷新，点一行看原文。
+
+写操作都要令牌，并校验 Host / Origin（防 DNS rebinding 和跨站）；页面适配大屏。额度的 JSON 接口：
 
 ```
 GET /api/usage            各账号 {account, plan, limit_reached, down_s, windows:[{name:"5h"|"7d", used_percent, remaining_percent, resets_in_s}]}，
                           和 providers 余额 [{provider, balances:[{currency,total}]}]；成功结果缓存 60 秒
 GET /api/usage?refresh=1  跳过缓存
-GET /health               进程、并发、各账号 down_s
+GET /health               进程、并发、各账号 down_s（只含参与轮换的账号）
 ```
 
-额度来自 ChatGPT 自己的 `/wham/usage`（Codex 同一个接口）。两个接口只读，不含令牌和邮箱，同样只监听 127.0.0.1。
+额度来自 ChatGPT 自己的 `/wham/usage`（Codex 同一个接口）。这两个接口只读，匿名访问只返回账号文件名（Codex 自己的登录态叫 `codex-login`），带面板令牌才返回邮箱；同样只监听 127.0.0.1。
 
 `max_concurrency = 0` 关闭并发限制，`max_retries = 0` 关闭 GPT 内部重试。并发设置可热更新；`retry_window` 限制安排重试的时间，不限制一次已开始的模型生成。多台机器或多个 witches 进程共用账号时，需要自行协调总并发。
 
