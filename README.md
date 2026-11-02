@@ -93,6 +93,7 @@ max_concurrency = 6
 | 功能 | 说明 |
 |---|---|
 | Chat 上游 | Responses ↔ Chat Completions 双向翻译：流式输出、并行工具调用、freeform 工具（`apply_patch`）、MCP 命名空间工具、`reasoning_content` 回传（kimi/deepseek 思考模式需要）、推理强度映射 |
+| DeepSeek 历史兼容 | 带工具的 Chat 请求完整回传已有推理；切换模型或旧历史没有可回传推理时，assistant 消息仍携带空的 `reasoning_content`，避免 DeepSeek 因字段缺失返回 400。不会解密其他模型的推理 |
 | 明文代理通信 | Chat 模型生成的 `collaboration.spawn_agent` / `send_message` / `followup_task` 调用显式带 `encrypted_function_args = []`，符合 Codex 的明文参数协议，避免把普通代理消息存成密文后触发审批解密失败。GPT 透传、原生 Responses 上游及已有加密标记保持原样 |
 | Responses 上游 | 原样转发，只给条目 id 打 `_wch` 标记、去掉别家的加密推理 |
 | 压缩 | 接住 Codex 的远程压缩（`compaction_trigger`）：把对话转成纯文本交给模型写摘要，再包成 compaction 条目还给 Codex；之后切回 GPT 时自动还原成明文 |
