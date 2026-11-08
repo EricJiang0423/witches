@@ -301,6 +301,28 @@ def effort(m, want):
 # ---------------------------------------------------------------- 上游连接
 
 _ctx = ssl.create_default_context()
+_direct = {'ok': False, 'at': -1e9}
+_direct_lock = threading.Lock()
+DIRECT_TTL = 600
+
+
+def direct_ok():
+    """能直连 OpenAI（支持地区回 401）就绕过环境代理；结果缓存 DIRECT_TTL 秒，上游连接出错时作废重测。"""
+    with _direct_lock:
+        if time.monotonic() - _direct['at'] < DIRECT_TTL:
+            return _direct['ok']
+        conn = http.client.HTTPSConnection('api.openai.com', timeout=3, context=_ctx)
+        try:
+            conn.request('GET', '/v1/models')
+            ok = conn.getresponse().status == 401
+        except OSError:
+            ok = False
+        finally:
+            conn.close()
+        if ok != _direct['ok'] or _direct['at'] < 0:
+            log(f'network: {"direct" if ok else "proxy"}')
+        _direct.update(ok=ok, at=time.monotonic())
+        return ok
 
 
 class Response:
@@ -422,6 +444,8 @@ def fetch(method, url, body=None, headers=None, timeout=900, cancel=None):
         proxy = urllib.request.getproxies_environment().get(u.scheme)
         if proxy and not proxy.startswith('http'):
             proxy = None  # ponytail: 只支持 http 代理，socks 需要时再加
+        if proxy and direct_ok():
+            proxy = None
     if proxy:
         pu = urllib.parse.urlsplit(proxy if '://' in proxy else 'http://' + proxy)
         auth = {}
@@ -460,8 +484,10 @@ def fetch(method, url, body=None, headers=None, timeout=900, cancel=None):
             cancel.connect_phase = 'response_headers'
             cancel.bind(conn)  # getresponse() 可能把 Connection: close 的 socket 从 conn 分离
         return Response(conn.getresponse(), conn)
-    except BaseException:
+    except BaseException as e:
         conn.close()
+        if isinstance(e, OSError):
+            _direct['at'] = -1e9  # 网络可能变了，下一次请求（含重试）重新探测
         raise
 
 
