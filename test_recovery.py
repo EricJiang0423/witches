@@ -155,9 +155,12 @@ class RecoveryTests(unittest.TestCase):
         self.cfg()
         self.jitter = patch('witches.random.uniform', return_value=0)
         self.jitter.start()
+        self.direct = patch('witches.direct_ok', return_value=False)  # 不探测真实网络，配了代理就走代理
+        self.direct.start()
 
     def tearDown(self):
         self.jitter.stop()
+        self.direct.stop()
         self.assertEqual(self.proxy.errors + self.up.errors, [])
 
     def cfg(self, extra='', limit=3):
@@ -992,6 +995,30 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
             self.assertEqual(parsed[-1]['response']['output'][0], item)
             self.up.scripts['gpt-x'] = [{'body': body}]
             self.assertEqual(self.post()[1], body)
+
+    def test_direct_probe_bypasses_proxy_and_resets_after_errors(self):
+        class NoContent(BaseHTTPRequestHandler):
+            def do_GET(inner):
+                inner.send_response(204)
+                inner.end_headers()
+
+            def log_message(inner, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), NoContent)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f'http://localhost:{server.server_port}/'
+        dead = {'http_proxy': 'http://127.0.0.1:9', 'no_proxy': ''}
+        try:
+            with patch.dict(os.environ, dead), patch('witches.direct_ok', return_value=True):
+                witches.fetch('GET', url, timeout=2).close()  # 能直连：绕过死代理
+            with patch.dict(os.environ, dead), patch.dict(witches._direct, at=time.monotonic()):
+                with self.assertRaises(OSError):
+                    witches.fetch('GET', url, timeout=2)  # 不能直连：走死代理失败
+                self.assertLess(witches._direct['at'], 0, 'connect errors must force a re-probe')
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == '__main__':
