@@ -1,5 +1,7 @@
 # witches
 
+当前版本：**0.1.7**（Codex 配置兼容性诊断与迁移）。
+
 给 [Codex](https://github.com/openai/codex) 加第三方模型的单文件代理：零依赖、无状态，对 Codex 只改一行配置。
 
 ```
@@ -38,6 +40,30 @@ mkdir -p ~/.witches && cp config.example.toml ~/.witches/config.toml   # 填上�
 卸载：`witches uninstall`（删掉那一行、停服务，`~/.witches` 保留）。
 
 > 如果 `config.toml` 里已经有别人写的 `openai_base_url`（比如 opencodex），install 会拒绝安装。请先卸载那个工具。
+
+### Codex 升级后的配置告警（0.1.7）
+
+`ignoring unrecognized configuration settings` 表示 Codex 忽略旧字段，不代表 witches 转发服务故障。安装、卸载仍只维护 `openai_base_url`；其他设置只在显式运行 `doctor --fix` 时迁移。
+
+```bash
+witches --version
+witches doctor                         # 只读预览，并用本机 Codex 严格校验迁移结果
+witches doctor --fix                   # 校验通过后备份、原子写入
+witches doctor --codex /path/to/codex   # 桌面端与 PATH 版本不同时，指定对应的可执行文件
+```
+
+当前规则适用于 **Codex CLI 0.153.4 及以上**：
+
+- 移除已被忽略的 `disable_response_storage`、`features.child_agents_md`；移除存储字段不代表改变服务端存储策略。
+- 将 `features.codex_hooks` 更名为 `features.hooks`，保留原布尔值。
+- 将顶层 `[env]` 字符串变量合并到 `[shell_environment_policy.set]`。这会让原先被忽略的变量传给 Codex 启动的命令，不配置 Codex 自身进程的环境；不会覆盖现有不同值。
+- 移除与 `command` / `url` 一致的 MCP `type`（`stdio` / `http` / `streamable-http`）；不猜测未知传输类型。
+
+检查使用临时 `CODEX_HOME`、空标准输入和有限超时运行 `codex --strict-config app-server --stdio`，不复制登录态、不创建会话、不调用模型。它验证指定 CLI 对这份用户配置的接受情况，不验证 MCP/上游连通性，也不代替桌面端版本及其他配置层的校验。较旧或无法确认的 Codex 版本、未知字段、值冲突、复杂内联写法或配置并发变化会阻止写入；未知字段不会被批量删除。
+
+修复保留无关配置及注释，先创建唯一的 `config.toml.witches-doctor-<时间>-<随机串>.bak`（权限 0600），再原子替换配置。重复运行不重复修改。失败时原文件保留；回退时可将命令打印的备份复制回原 `config.toml`。符号链接配置需要手动迁移实际目标。命令不重启 witches 或 Codex，重新加载 Codex 配置后检查告警；不要为了刷新设置打断正在运行的任务。
+
+配置依据：[OpenAI 配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)。
 
 ### 远程服务器（Codex remote）
 
@@ -111,6 +137,8 @@ max_concurrency = 6
 witches install [--port N]     本机安装并接入 Codex
 witches uninstall              移除那一行配置并停服务
 witches status                 接入状态、服务、各上游连通性、route
+witches doctor [--fix] [--codex PATH]  诊断或备份迁移 Codex 旧配置
+witches --version              显示版本
 witches serve [--port N]       前台运行（调试用）
 witches deploy <ssh-host>      同步到远端并安装
 ```
@@ -147,7 +175,7 @@ GPT 日志中的 `chain_id` 关联同一请求的全部尝试，`request_id` 是
 GET /api/usage            各账号 {account, plan, limit_reached, down_s, windows:[{name:"5h"|"7d", used_percent, remaining_percent, resets_in_s}]}，
                           和 providers 余额 [{provider, balances:[{currency,total}]}]；成功结果缓存 60 秒
 GET /api/usage?refresh=1  跳过缓存
-GET /health               进程、并发、各账号 down_s（只含参与轮换的账号）
+GET /health               版本、进程、并发、各账号 down_s（只含参与轮换的账号）
 ```
 
 额度来自 ChatGPT 自己的 `/wham/usage`（Codex 同一个接口）。这两个接口只读，匿名访问只返回账号文件名（Codex 自己的登录态叫 `codex-login`），带面板令牌才返回邮箱；同样只监听 127.0.0.1。
@@ -176,6 +204,7 @@ TLS socket 在握手开始前即交给取消监视器，因此直连和 CONNECT 
 
 ```bash
 ./test_witches.py      # 端到端自检：假 ChatGPT 后端 + 假上游，覆盖透传、翻译、压缩、fallback、改派、看图
+uv run --script test_compat.py    # 配置迁移、冲突保护、备份、幂等和隔离校验（离线）
 uv run --script test_recovery.py  # 容量错误、首输出边界、断流、Retry-After、并发与排队超时
 ```
 

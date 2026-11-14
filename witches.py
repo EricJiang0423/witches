@@ -9,7 +9,9 @@ Codex 内置的 openai provider 经 `openai_base_url` 指向本机 witches：
   * `provider/model`：转发到 ~/.witches/config.toml 里配置的上游（Chat 或 Responses 接口）
   * [route]：按 Codex 的 x-openai-subagent 头，把子代理/审查请求改派给第三方模型
 """
+import argparse
 import base64
+import copy
 import datetime
 import hashlib
 import hmac
@@ -26,21 +28,24 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
 import urllib.parse
 import urllib.request
 import uuid
-from compression import zstd
 from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from compression import zstd
+
 HOME = Path(os.environ.get('WITCHES_HOME') or Path.home() / '.witches')
 CODEX_HOME = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
 OPENAI = {'/backend-api/codex': 'https://chatgpt.com/backend-api/codex', '/v1': 'https://api.openai.com/v1'}
+VERSION = '0.1.7'
 DEFAULT_PORT = 10777
 BIN = Path.home() / '.local/bin/witches'
 MARK = '# witches'
@@ -740,7 +745,7 @@ def health():
         with _down_lock:
             out['accounts'] = [{'account': account_name(a), 'down_s': round(max(0, _down.get(a, 0) - now))}
                                for a in account_pool(opts)]
-    return {'ok': True, 'pid': os.getpid(), 'openai': out}
+    return {'ok': True, 'version': VERSION, 'pid': os.getpid(), 'openai': out}
 
 
 def retry_after(value):
@@ -2277,6 +2282,221 @@ def base_url(port):
     return f'http://127.0.0.1:{port}/backend-api/codex'
 
 
+def _toml_path(key):
+    """Let tomllib decode quoted/dotted keys; never split quoted names on dots."""
+    value = tomllib.loads(key + ' = 0')
+    path = []
+    while isinstance(value, dict):
+        name, value = next(iter(value.items()))
+        path.append(name)
+    return tuple(path)
+
+
+def _toml_records(text):
+    """Locate complete statements without treating multiline string contents as keys."""
+    lines = text.splitlines(keepends=True)
+    records, section, i = [], (), 0
+    key = r'(?:[A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*"|\'[^\']*\')'
+    assignment = re.compile(r'\s*(' + key + r'(?:\s*\.\s*' + key + r')*)\s*=')
+    while i < len(lines):
+        start = i
+        line = lines[i].strip()
+        i += 1
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('['):
+            # Array-of-tables entries are outside these migrations.
+            array = line.startswith('[[')
+            table = tomllib.loads(lines[start] + '\n__witches_marker__ = 0')
+            path = []
+            while isinstance(table, dict):
+                name, table = next(iter(table.items()))
+                path.append(name)
+            section = None if array else tuple(path[:-1])
+            records.append(('table', section, start, i, None))
+            continue
+        match = assignment.match(lines[start])
+        if not match:
+            raise ValueError('不支持的 TOML 写法；未修改配置')
+        while True:
+            try:
+                tomllib.loads(''.join(lines[start:i]))
+                break
+            except tomllib.TOMLDecodeError:
+                if i == len(lines):
+                    raise ValueError('无法定位 TOML 字段；未修改配置') from None
+                i += 1
+        path = section + _toml_path(match[1]) if section is not None else None
+        records.append(('value', path, start, i, match))
+    return lines, records
+
+
+def codex_compat_plan(text):
+    """Known migrations for Codex >= 0.153.4; preserve all unrelated TOML bytes."""
+    original = tomllib.loads(text)
+    expected = copy.deepcopy(original)
+    lines, records = _toml_records(text)
+    edits, changes = [], []
+
+    def remove(path):
+        matches = [r for r in records if r[0] == 'value' and r[1] == path]
+        if len(matches) != 1:
+            raise ValueError('字段使用内联表等复杂写法，请手动迁移：' + '.'.join(path))
+        _, _, start, end, _ = matches[0]
+        edits.append((start, end, ''))
+
+    if 'disable_response_storage' in expected:
+        remove(('disable_response_storage',))
+        del expected['disable_response_storage']
+        changes.append('disable_response_storage：移除当前版本忽略的字段（不改变存储策略）')
+    features = expected.get('features', {})
+    if 'child_agents_md' in features:
+        remove(('features', 'child_agents_md'))
+        del features['child_agents_md']
+        changes.append('features.child_agents_md：移除不再识别的字段')
+    if 'codex_hooks' in features:
+        old = features['codex_hooks']
+        if not isinstance(old, bool):
+            raise ValueError('features.codex_hooks 必须是布尔值；未修改配置')
+        if 'hooks' in features and features['hooks'] != old:
+            raise ValueError('features.hooks 与 codex_hooks 冲突；未修改配置')
+        remove(('features', 'codex_hooks'))
+        if 'hooks' not in features:
+            start, end, _ = edits.pop()
+            match = next(r[4] for r in records if r[0] == 'value' and r[1] == ('features', 'codex_hooks'))
+            key = '.'.join(k if re.fullmatch(r'[A-Za-z0-9_-]+', k) else json.dumps(k)
+                           for k in (*_toml_path(match[1])[:-1], 'hooks'))
+            line = lines[start][:match.start(1)] + key + lines[start][match.end(1):]
+            edits.append((start, end, line))
+        features['hooks'] = features.pop('codex_hooks')
+        changes.append('features.codex_hooks → features.hooks')
+    for name, server in expected.get('mcp_servers', {}).items():
+        if 'type' not in server:
+            continue
+        kind = server['type']
+        redundant = ((kind == 'stdio' and isinstance(server.get('command'), str) and not server.get('url'))
+                     or (kind in ('http', 'streamable-http') and isinstance(server.get('url'), str)
+                         and not server.get('command')))
+        if not redundant:
+            raise ValueError('MCP type 与 command/url 不匹配，请手动核对：mcp_servers.' + name)
+        remove(('mcp_servers', name, 'type'))
+        del server['type']
+        changes.append('mcp_servers.' + name + '.type：移除冗余类型，由 command/url 确定传输')
+    if 'env' in expected:
+        env = expected['env']
+        if not isinstance(env, dict) or any(not isinstance(v, str) for v in env.values()):
+            raise ValueError('[env] 不是字符串映射；未修改配置')
+        target = (expected.setdefault('shell_environment_policy', {}).setdefault('set', {})
+                  if env else expected.get('shell_environment_policy', {}).get('set', {}))
+        if any(k in target and target[k] != v for k, v in env.items()):
+            raise ValueError('[env] 与 shell_environment_policy.set 存在冲突；未修改配置')
+        additions = {k: v for k, v in env.items() if k not in target}
+        for k in env:
+            remove(('env', k))
+        for kind, path, start, end, _ in records:
+            if kind == 'table' and path == ('env',):
+                edits.append((start, end, ''))
+        # Insert into an existing explicit table, otherwise add dotted root keys.
+        tables = [r for r in records if r[0] == 'table' and r[1] == ('shell_environment_policy', 'set')]
+        at = tables[0][3] if tables else 0
+        parent_tables = [r for r in records if r[0] == 'table' and r[1] == ('shell_environment_policy',)]
+        if not tables and parent_tables:
+            at = parent_tables[0][3]
+        prefix = '' if tables else ('set.' if parent_tables else 'shell_environment_policy.set.')
+        added = ''.join(prefix + json.dumps(k, ensure_ascii=False) + ' = ' + json.dumps(v, ensure_ascii=False)
+                        + '\n' for k, v in additions.items())
+        if added:
+            edits.append((at, at, added))
+        target.update(env)
+        del expected['env']
+        changes.append('env → shell_environment_policy.set（命令环境变量）')
+    for start, end, value in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        lines[start:end] = [value] if value else []
+    result = ''.join(lines)
+    if tomllib.loads(result) != expected:
+        raise ValueError('迁移结果与预期不一致；未修改配置')
+    return result, changes
+
+
+def check_codex_config(text, executable='codex'):
+    """Validate in a private temporary home, EOF immediately; no login or model request."""
+    try:
+        version = subprocess.run([executable, '--version'], capture_output=True, text=True, timeout=10, check=False)
+        match = re.search(r'codex-cli (\d+)\.(\d+)\.(\d+)', version.stdout)
+        if version.returncode or not match or tuple(map(int, match.groups())) < (0, 153, 4):
+            raise ValueError('需要 Codex CLI >= 0.153.4 验证；可用 --codex 指定匹配桌面端的可执行文件')
+        with tempfile.TemporaryDirectory(prefix='witches-doctor-') as tmp:
+            path = Path(tmp) / 'config.toml'
+            path.touch(mode=0o600)
+            path.write_text(text)
+            proc = subprocess.run([executable, '--strict-config', 'app-server', '--stdio'], input='',
+                                  capture_output=True, text=True, timeout=15, cwd=tmp, check=False,
+                                  env={**os.environ, 'CODEX_HOME': tmp})
+        if proc.returncode:
+            field = re.search(r'unknown configuration field `([A-Za-z0-9_.-]+)`', proc.stderr)
+            detail = '，仍有未知字段：' + field[1] if field else '，请用对应 Codex 查看配置错误'
+            raise ValueError('Codex 严格校验未通过' + detail + '；未修改配置')
+        return match[0]
+    except (OSError, subprocess.TimeoutExpired):
+        raise ValueError('Codex 校验无法完成（命令缺失、权限不足或超时）；未修改配置') from None
+
+
+def doctor(fix=False, executable='codex'):
+    path = CODEX_HOME / 'config.toml'
+    try:
+        if not path.exists():
+            print('没有 Codex config.toml；无需迁移')
+            return 0
+        # Refuse symlinks so an atomic replacement never detaches a managed config.
+        if fix and path.is_symlink():
+            raise ValueError('config.toml 是符号链接；请在实际目标文件上手动迁移')
+        before = path.read_bytes()
+        updated, changes = codex_compat_plan(before.decode())
+        print('witches ' + VERSION + ' / Codex 配置兼容性')
+        for change in changes:
+            print('  - ' + change)
+        version = check_codex_config(updated, executable)
+        print(version + '：迁移后配置严格校验通过' if changes else version + '：配置严格校验通过')
+        if not changes:
+            return 0
+        if not fix:
+            print('尚未修改；运行 witches doctor --fix 应用以上迁移（先备份）')
+            return 0
+        if path.read_bytes() != before:
+            raise ValueError('配置在校验期间已被修改，请重新运行')
+        backup = path.with_name('config.toml.witches-doctor-' + time.strftime('%Y%m%d-%H%M%S')
+                                + '-' + uuid.uuid4().hex[:8] + '.bak')
+        with backup.open('xb') as f:
+            os.chmod(backup, 0o600)
+            f.write(before)
+            f.flush()
+            os.fsync(f.fileno())
+        temp = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.witches-doctor-', delete=False) as f:
+                temp = Path(f.name)
+                f.write(updated.encode())
+                f.flush()
+                os.fsync(f.fileno())
+            if path.read_bytes() != before:
+                raise ValueError('配置在写入前已被修改，已保留备份，请重新运行')
+            os.replace(temp, path)
+        finally:
+            if temp is not None:
+                temp.unlink(missing_ok=True)
+        print('已修复；备份：' + str(backup))
+        print('重新加载 Codex 配置后生效；未重启服务或正在运行的任务')
+        return 0
+    except (ValueError, OSError):
+        # Never print arbitrary TOML/error text: it can contain keys or credentials.
+        exc = sys.exception()
+        if type(exc) is ValueError:
+            print(str(exc), file=sys.stderr)
+        else:
+            print('配置读取、解析或写入失败；请检查 TOML 格式与文件权限', file=sys.stderr)
+        return 1
+
+
 def edit_codex(port=None):
     """往 config.toml 顶部加（port=None 时删除）唯一一行 openai_base_url；改之前先备份。"""
     path = CODEX_HOME / 'config.toml'
@@ -2397,6 +2617,7 @@ def install(port):
     edit_codex(port)
     print(f'✓ witches 已在 127.0.0.1:{port} 常驻；{CODEX_HOME / "config.toml"} 只加了一行 openai_base_url')
     print(f'  配置：{HOME / "config.toml"}    命令：{BIN} status')
+    print('  Codex 配置告警可运行 witches doctor 检查；需要迁移时运行 witches doctor --fix')
     print('  已加载的 Codex 线程要重启 app-server 才会生效：codex app-server daemon restart（会打断正在跑的任务）')
 
 
@@ -2448,6 +2669,15 @@ def deploy(host):
 def main():
     args = sys.argv[1:]
     cmd = args[0] if args else 'help'
+    if cmd in ('--version', 'version'):
+        print('witches ' + VERSION)
+        return
+    if cmd == 'doctor':
+        parser = argparse.ArgumentParser(prog='witches doctor', description='检查 Codex 配置兼容性')
+        parser.add_argument('--fix', action='store_true', help='备份并应用已知迁移')
+        parser.add_argument('--codex', default='codex', help='用于严格校验的 Codex 可执行文件')
+        options = parser.parse_args(args[1:])
+        sys.exit(doctor(options.fix, options.codex))
     port = int(args[args.index('--port') + 1]) if '--port' in args else config().get('port', DEFAULT_PORT)
     if cmd == 'serve':
         serve(port)
@@ -2469,6 +2699,7 @@ def main():
     else:
         print(__doc__)
         print('用法: witches serve|install|uninstall|status|panel [--port N] | deploy <ssh-host>')
+        print('      witches doctor [--fix] [--codex PATH] | --version')
 
 
 if __name__ == '__main__':
