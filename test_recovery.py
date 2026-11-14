@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from compression import zstd
 from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -120,6 +121,15 @@ class Upstream(BaseHTTPRequestHandler):
 
 
 class Proxy(witches.Handler):
+    def do_POST(self):
+        try:
+            super().do_POST()
+        finally:
+            with self.server.lock:
+                completed = self.server.completed.get(self.headers.get('X-Test-Request-Id'))
+            if completed is not None:
+                completed.set()
+
     def log(self, msg):
         with self.server.lock:
             self.server.logs.append(msg)
@@ -139,6 +149,7 @@ class RecoveryTests(unittest.TestCase):
         for server in (cls.up, cls.proxy):
             server.lock = threading.Lock()
             server.errors = []
+            server.completed = {}
             threading.Thread(target=server.serve_forever, daemon=True).start()
         witches.OPENAI['/backend-api/codex'] = f'http://127.0.0.1:{cls.up.server_port}'
 
@@ -174,9 +185,14 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
 
     def post(self, model='gpt-x', path='/responses', raw=None, headers=None):
         conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=5)
+        request_id = uuid.uuid4().hex
+        completed = threading.Event()
+        with self.proxy.lock:
+            self.proxy.completed[request_id] = completed
         body = raw or json.dumps({'model': model, 'stream': True, 'input': []}).encode()
         conn.request('POST', '/backend-api/codex' + path, body, {
-            'Content-Type': 'application/json', 'Authorization': 'Bearer TOKEN', **(headers or {})})
+            'Content-Type': 'application/json', 'Authorization': 'Bearer TOKEN', **(headers or {}),
+            'X-Test-Request-Id': request_id})
         try:
             r = conn.getresponse()
             status, response_headers = r.status, dict(r.getheaders())
@@ -188,6 +204,10 @@ base_url = "http://127.0.0.1:{self.up.server_port}"
             return status, data, response_headers, truncated
         finally:
             conn.close()
+            # HTTP EOF can arrive before final logging and gate cleanup on Linux.
+            self.assertTrue(completed.wait(5), 'proxy request did not finish')
+            with self.proxy.lock:
+                self.proxy.completed.pop(request_id, None)
 
     def health(self):
         conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=5)
